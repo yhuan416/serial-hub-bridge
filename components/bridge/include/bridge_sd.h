@@ -57,6 +57,10 @@ typedef struct {
     uint32_t earliest_seq;      /* current segment */
     uint32_t latest_seq;        /* current segment */
     uint32_t global_latest_seq; /* max latest_seq across segments */
+    uint64_t queue_bytes;   /* SD submit queue capacity */
+    uint64_t queue_used;
+    uint32_t queue_dropped;
+    uint64_t queue_dropped_bytes;
     char segment[40];
     size_t segment_count;
     bridge_sd_segment_t segments[BRIDGE_SD_MAX_SEGMENTS];
@@ -88,13 +92,12 @@ bool bridge_sd_ready(void);
 uint32_t bridge_sd_latest_seq(void);
 void bridge_sd_sync(void);
 
-/* Raw append (called from the UART RX/TX path). */
-void bridge_sd_log_rx(const uint8_t *data, size_t len);
-void bridge_sd_log_tx(const uint8_t *data, size_t len);
-
-/* One index record per completed RX line (raw_len includes CR/LF) or TX write. */
-void bridge_sd_index_line(uint32_t seq, int64_t tick_ms, uint8_t dir,
-                          uint64_t offset, uint32_t raw_len);
+/* Enqueue one atomic raw+index record for the SD writer task.
+ * Called from the UART path; never performs FAT I/O and never blocks on SD.
+ * raw_len == len + 1 means "append LF" (RX line); raw_len == len means exact.
+ * Returns false when the PSRAM queue is full (counted as queue_dropped). */
+bool bridge_sd_submit(uint32_t seq, int64_t tick_ms, uint8_t dir,
+                      const uint8_t *data, uint16_t len, uint16_t raw_len);
 
 void bridge_sd_get_status(bridge_sd_status_t *out);
 

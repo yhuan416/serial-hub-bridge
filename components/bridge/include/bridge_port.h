@@ -47,6 +47,10 @@ typedef struct {
     size_t ring_used;
     size_t ring_capacity;
     uint64_t ring_dropped_bytes;
+    uint64_t rx_bytes;          /* absolute RX bytes delivered by UART */
+    uint64_t tx_bytes;          /* absolute TX bytes accepted */
+    uint64_t uart_overflow_bytes;
+    uint32_t uart_overflow_events;
 } bridge_port_stat_t;
 
 typedef struct {
@@ -118,6 +122,10 @@ bool bridge_port_log_get(bridge_port_t *p,
 
 void bridge_port_log_clear(bridge_port_t *p, bool reset_seq);
 void bridge_port_log_set_seq(bridge_port_t *p, uint32_t seq);
+
+/* Flush an unterminated RX line as its own log entry (called periodically and
+ * before export) so the SD tail does not wait forever for a newline. */
+void bridge_port_log_flush_partial(bridge_port_t *p);
 
 #ifdef __cplusplus
 }

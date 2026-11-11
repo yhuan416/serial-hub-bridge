@@ -816,12 +816,23 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
     cJSON_AddNumberToObject(r, "sd_write_errors", (double)sd.write_errors);
     cJSON_AddBoolToObject(r, "sd_broken", sd.broken);
 
+    cJSON_AddNumberToObject(r, "rx_bytes", (double)st.rx_bytes);
+    cJSON_AddNumberToObject(r, "tx_bytes", (double)st.tx_bytes);
+    cJSON_AddNumberToObject(r, "uart_overflow_events", (double)st.uart_overflow_events);
+    cJSON_AddNumberToObject(r, "uart_overflow_bytes", (double)st.uart_overflow_bytes);
+
     cJSON *ring = cJSON_AddObjectToObject(r, "ring");
     cJSON_AddNumberToObject(ring, "bytes", (double)st.ring_capacity);
     cJSON_AddNumberToObject(ring, "used", (double)st.ring_used);
     cJSON_AddNumberToObject(ring, "start_offset", (double)st.ring_start_offset);
     cJSON_AddNumberToObject(ring, "end_offset", (double)st.ring_end_offset);
     cJSON_AddNumberToObject(ring, "dropped_bytes", (double)st.ring_dropped_bytes);
+
+    cJSON *q = cJSON_AddObjectToObject(r, "sd_queue");
+    cJSON_AddNumberToObject(q, "bytes", (double)sd.queue_bytes);
+    cJSON_AddNumberToObject(q, "used", (double)sd.queue_used);
+    cJSON_AddNumberToObject(q, "dropped", (double)sd.queue_dropped);
+    cJSON_AddNumberToObject(q, "dropped_bytes", (double)sd.queue_dropped_bytes);
 
     cJSON *time = cJSON_AddObjectToObject(r, "time");
     cJSON_AddBoolToObject(time, "synced", false);

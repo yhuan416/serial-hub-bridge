@@ -12,13 +12,16 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "bridge_event.h"
+#include "bridge.h"
 #include "bridge_port.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 #include "sdmmc_cmd.h"
 
@@ -28,6 +31,9 @@
 #ifndef CONFIG_BRIDGE_SD_SEGMENT_MAX_MB
 #define CONFIG_BRIDGE_SD_SEGMENT_MAX_MB 3584
 #endif
+#ifndef CONFIG_BRIDGE_SD_QUEUE_BYTES
+#define CONFIG_BRIDGE_SD_QUEUE_BYTES 3145728
+#endif
 
 #define TAG "bridge_sd"
 
@@ -35,6 +41,17 @@
 #define EXPORT_CHUNK_MAX 32768
 #define EXPORT_LINES_MAX 512
 #define RETENTION_EVERY 60
+#define SD_Q_HDR 16
+
+typedef struct __attribute__((packed)) {
+    uint32_t seq;
+    uint32_t tick_ms;
+    uint16_t len;
+    uint16_t raw_len;
+    uint8_t dir;
+    uint8_t flags;
+    uint16_t reserved;
+} sd_q_hdr_t;
 
 static SemaphoreHandle_t s_lock;
 static sdmmc_card_t *s_card;
@@ -61,8 +78,23 @@ static uint32_t s_sync_ticks;
 static bridge_port_t *s_port;
 static uint32_t s_resume_seq;
 
+static uint8_t *s_qbuf;
+static size_t s_qcap;
+static size_t s_qhead;
+static size_t s_qtail;
+static size_t s_qused;
+static SemaphoreHandle_t s_qlock;
+static SemaphoreHandle_t s_qsig;
+static TaskHandle_t s_qtask;
+static uint32_t s_qdrop;
+static uint64_t s_qdrop_bytes;
+static uint32_t s_qdrop_event_ms;
+
 static esp_err_t sd_try_mount(int attempts);
 static void sd_remount(void);
+static void sd_writer_task(void *arg);
+static bool sd_seg_id_ok(const char *id);
+static void sd_paths_for(const char *id, char paths[4][96]);
 
 static void sd_lock(void)
 {
@@ -115,76 +147,85 @@ static void sd_close_segment_locked(void)
 static void sd_retention_locked(void)
 {
     typedef struct {
-        char name[64];
+        char id[40];
         uint64_t size;
         time_t mtime;
         bool deleted;
-    } ent_t;
-
-    const int max_ents = 64;
-    ent_t *ents = (ent_t *)calloc(max_ents, sizeof(ent_t));
-    if (!ents) {
-        return;
-    }
-
-    int n = 0;
+    } seg_ent_t;
+    const int max_segs = 64;
+    seg_ent_t *segs = (seg_ent_t *)calloc(max_segs, sizeof(seg_ent_t));
+    if (!segs) return;
     DIR *d = opendir(SD_DIR);
     if (!d) {
-        free(ents);
+        free(segs);
         return;
     }
+    int n = 0;
     struct dirent *de;
-    while ((de = readdir(d)) != NULL && n < max_ents) {
-        if (de->d_name[0] == '.' || strlen(de->d_name) >= sizeof(ents[n].name)) {
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        const char *p = NULL;
+        if (strncmp(name, "raw-rx-", 7) == 0 || strncmp(name, "raw-tx-", 7) == 0 ||
+            strncmp(name, "idx-rx-", 7) == 0 || strncmp(name, "idx-tx-", 7) == 0) {
+            p = name + 7;
+        } else {
             continue;
         }
-        char full[128];
-        snprintf(full, sizeof(full), "%s/%.63s", SD_DIR, de->d_name);
+        const char *dot = strstr(p, ".bin");
+        if (!dot) continue;
+        size_t idlen = (size_t)(dot - p);
+        if (idlen == 0 || idlen >= sizeof(segs[0].id)) continue;
+        char id[40] = {0};
+        memcpy(id, p, idlen);
+        if (!sd_seg_id_ok(id)) continue;
+        int idx = -1;
+        for (int i = 0; i < n; i++) {
+            if (strcmp(segs[i].id, id) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) {
+            if (n >= max_segs) continue;
+            idx = n++;
+            snprintf(segs[idx].id, sizeof(segs[idx].id), "%s", id);
+            segs[idx].size = 0;
+            segs[idx].mtime = 0;
+            segs[idx].deleted = false;
+        }
+        char full[320];
+        snprintf(full, sizeof(full), "%s/%s", SD_DIR, name);
         struct stat st;
-        if (stat(full, &st) != 0) {
-            continue;
+        if (stat(full, &st) == 0) {
+            segs[idx].size += (uint64_t)st.st_size;
+            if (st.st_mtime > segs[idx].mtime) segs[idx].mtime = st.st_mtime;
         }
-        snprintf(ents[n].name, sizeof(ents[n].name), "%.63s", de->d_name);
-        ents[n].size = (uint64_t)st.st_size;
-        ents[n].mtime = st.st_mtime;
-        ents[n].deleted = false;
-        n++;
     }
     closedir(d);
 
     uint64_t total = 0;
-    for (int i = 0; i < n; i++) {
-        total += ents[i].size;
-    }
+    for (int i = 0; i < n; i++) total += segs[i].size;
     const uint64_t retain = (uint64_t)CONFIG_BRIDGE_SD_RETAIN_MB * 1024ULL * 1024ULL;
 
     while (total > retain) {
         int oldest = -1;
         for (int i = 0; i < n; i++) {
-            if (!ents[i].deleted && (oldest < 0 || ents[i].mtime < ents[oldest].mtime)) {
-                oldest = i;
-            }
+            if (segs[i].deleted || (!s_id[0] ? false : strcmp(segs[i].id, s_id) == 0)) continue;
+            if (oldest < 0 || segs[i].mtime < segs[oldest].mtime) oldest = i;
         }
-        if (oldest < 0) {
-            break;
-        }
-        if (s_id[0] && strstr(ents[oldest].name, s_id)) {
-            ents[oldest].deleted = true;
-            total -= ents[oldest].size;
-            continue;
-        }
-        char full[128];
-        snprintf(full, sizeof(full), "%s/%.63s", SD_DIR, ents[oldest].name);
-        ESP_LOGI(TAG, "retention: remove %s (%llu KiB)", full,
-                 (unsigned long long)(ents[oldest].size / 1024));
+        if (oldest < 0) break;
+        char paths[4][96];
+        sd_paths_for(segs[oldest].id, paths);
+        for (int k = 0; k < 4; k++) unlink(paths[k]);
+        ESP_LOGI(TAG, "retention: remove segment %s (%llu KiB)", segs[oldest].id,
+                 (unsigned long long)(segs[oldest].size / 1024));
         bridge_event_push(BRIDGE_EVENT_INFO, "sd.retention",
-                          "removed %.63s (%llu KiB)", ents[oldest].name,
-                          (unsigned long long)(ents[oldest].size / 1024));
-        unlink(full);
-        total -= ents[oldest].size;
-        ents[oldest].deleted = true;
+                          "removed segment %.39s (%llu KiB)", segs[oldest].id,
+                          (unsigned long long)(segs[oldest].size / 1024));
+        total -= segs[oldest].size;
+        segs[oldest].deleted = true;
     }
-    free(ents);
+    free(segs);
 }
 
 static bool sd_seg_id_ok(const char *id)
@@ -440,7 +481,15 @@ static esp_err_t sd_resume_or_create_locked(void)
     uint32_t global_latest = 0;
     int n = sd_scan_segments_locked(segs, BRIDGE_SD_MAX_SEGMENTS, &global_latest);
     if (n > 0) {
-        const char *id = segs[n - 1].id;
+        int best = 0;
+        for (int i = 1; i < n; i++) {
+            if (segs[i].last_seq > segs[best].last_seq ||
+                (segs[i].last_seq == segs[best].last_seq &&
+                 segs[i].mtime_s > segs[best].mtime_s)) {
+                best = i;
+            }
+        }
+        const char *id = segs[best].id;
         if (sd_open_existing_locked(id)) {
             s_resume_seq = global_latest > s_last_seq ? global_latest : s_last_seq;
             bridge_event_push(BRIDGE_EVENT_INFO, "sd.resume",
@@ -634,6 +683,9 @@ static void sd_sync_timer(void *arg)
         sd_fsync(s_raw[i]);
         sd_fsync(s_idx[i]);
     }
+    if (s_port) {
+        bridge_port_log_flush_partial(s_port);
+    }
     if (++s_sync_ticks % RETENTION_EVERY == 0) {
         sd_retention_locked();
     }
@@ -657,6 +709,27 @@ esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t *port)
     }
     s_enabled = true;
     s_bus_ready = spi_bus_ready;
+    s_qcap = CONFIG_BRIDGE_SD_QUEUE_BYTES;
+    if (s_qcap < 65536) s_qcap = 65536;
+    s_qbuf = (uint8_t *)heap_caps_malloc(s_qcap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_qbuf) {
+        s_qbuf = (uint8_t *)heap_caps_malloc(s_qcap, MALLOC_CAP_8BIT);
+    }
+    if (!s_qbuf) {
+        ESP_LOGW(TAG, "SD queue alloc failed (%u bytes); SD logging via queue disabled",
+                 (unsigned)s_qcap);
+        s_qcap = 0;
+    } else {
+        s_qlock = xSemaphoreCreateMutex();
+        s_qsig = xSemaphoreCreateBinary();
+        if (!s_qlock || !s_qsig ||
+            xTaskCreate(sd_writer_task, "sd_writer", 8192, NULL, 5, &s_qtask) != pdPASS) {
+            ESP_LOGW(TAG, "SD writer task init failed; SD logging via queue disabled");
+            s_qcap = 0;
+        } else {
+            ESP_LOGI(TAG, "SD queue %u KiB, writer task started", (unsigned)(s_qcap / 1024));
+        }
+    }
 
     const esp_timer_create_args_t sync_args = {
         .callback = sd_sync_timer,
@@ -721,80 +794,183 @@ static void sd_note_write_error(const char *dir)
     }
 }
 
-void bridge_sd_log_rx(const uint8_t *data, size_t len)
+static void sd_q_write(const uint8_t *src, size_t len)
 {
-    if (!data || len == 0) {
-        return;
+    size_t first = s_qcap - s_qtail;
+    if (first > len) first = len;
+    memcpy(s_qbuf + s_qtail, src, first);
+    if (len > first) {
+        memcpy(s_qbuf, src + first, len - first);
     }
-    sd_lock();
-    if (!s_mounted || s_broken || !s_raw[0]) {
-        sd_unlock();
-        return;
-    }
-    if (fwrite(data, 1, len, s_raw[0]) == len) {
-        s_raw_bytes[0] += len;
-    } else {
-        sd_note_write_error("rx");
-    }
-    sd_unlock();
+    s_qtail = (s_qtail + len) % s_qcap;
+    s_qused += len;
 }
 
-void bridge_sd_log_tx(const uint8_t *data, size_t len)
+static void sd_q_read(uint8_t *dst, size_t len)
 {
-    if (!data || len == 0) {
-        return;
+    size_t first = s_qcap - s_qhead;
+    if (first > len) first = len;
+    memcpy(dst, s_qbuf + s_qhead, first);
+    if (len > first) {
+        memcpy(dst + first, s_qbuf, len - first);
     }
-    sd_lock();
-    if (!s_mounted || s_broken || !s_raw[1]) {
-        sd_unlock();
-        return;
-    }
-    if (fwrite(data, 1, len, s_raw[1]) == len) {
-        s_raw_bytes[1] += len;
-    } else {
-        sd_note_write_error("tx");
-    }
-    sd_unlock();
+    s_qhead = (s_qhead + len) % s_qcap;
+    s_qused -= len;
 }
 
-void bridge_sd_index_line(uint32_t seq, int64_t tick_ms, uint8_t dir,
-                          uint64_t offset, uint32_t raw_len)
+static void sd_q_reset_locked(void)
 {
-    (void)offset; /* index offsets are segment-relative (raw_bytes - raw_len). */
-    if (dir > 1 || raw_len == 0) {
-        return;
+    s_qhead = 0;
+    s_qtail = 0;
+    s_qused = 0;
+}
+
+static void sd_q_reset(void)
+{
+    if (!s_qlock) return;
+    xSemaphoreTake(s_qlock, portMAX_DELAY);
+    sd_q_reset_locked();
+    xSemaphoreGive(s_qlock);
+}
+
+static bool sd_q_dequeue(sd_q_hdr_t *h, uint8_t *data)
+{
+    if (!s_qlock || !s_qbuf || !h || !data) {
+        return false;
     }
-    sd_lock();
-    if (!s_mounted || s_broken || !s_idx[dir]) {
-        sd_unlock();
-        return;
+    xSemaphoreTake(s_qlock, portMAX_DELAY);
+    if (s_qused < SD_Q_HDR) {
+        xSemaphoreGive(s_qlock);
+        return false;
     }
-    uint64_t seg_off = s_raw_bytes[dir] >= raw_len ? s_raw_bytes[dir] - raw_len : 0;
-    sd_idx_rec_t rec = {
-        .offset = seg_off,
+    sd_q_read((uint8_t *)h, SD_Q_HDR);
+    if (h->len > CONFIG_BRIDGE_MAX_FRAME || h->raw_len < h->len ||
+        h->raw_len > (uint16_t)(h->len + 1)) {
+        sd_q_reset_locked();
+        xSemaphoreGive(s_qlock);
+        bridge_event_push(BRIDGE_EVENT_ERROR, "sd.queue_bad", "corrupt queue record");
+        return false;
+    }
+    if (s_qused < h->len) {
+        sd_q_reset_locked();
+        xSemaphoreGive(s_qlock);
+        bridge_event_push(BRIDGE_EVENT_ERROR, "sd.queue_bad", "truncated queue record");
+        return false;
+    }
+    sd_q_read(data, h->len);
+    xSemaphoreGive(s_qlock);
+    return true;
+}
+
+static void sd_q_note_drop(size_t len)
+{
+    s_qdrop++;
+    s_qdrop_bytes += len;
+    uint32_t now = (uint32_t)bridge_now_ms();
+    if (s_qdrop_event_ms == 0 || now - s_qdrop_event_ms >= 10000) {
+        s_qdrop_event_ms = now;
+        bridge_event_push(BRIDGE_EVENT_WARN, "sd.queue_drop",
+                          "SD queue full; dropped %llu bytes (total %llu, events %lu)",
+                          (unsigned long long)len, (unsigned long long)s_qdrop_bytes,
+                          (unsigned long)s_qdrop);
+    }
+}
+
+bool bridge_sd_submit(uint32_t seq, int64_t tick_ms, uint8_t dir,
+                      const uint8_t *data, uint16_t len, uint16_t raw_len)
+{
+    if (!s_qbuf || !s_qlock || !s_qcap || !data || dir > 1 ||
+        len > CONFIG_BRIDGE_MAX_FRAME || raw_len < len || raw_len > (uint16_t)(len + 1) ||
+        (len == 0 && raw_len == 0)) {
+        return false;
+    }
+    const size_t total = SD_Q_HDR + len;
+    xSemaphoreTake(s_qlock, portMAX_DELAY);
+    if (s_qused + total > s_qcap) {
+        xSemaphoreGive(s_qlock);
+        sd_q_note_drop(len);
+        return false;
+    }
+    sd_q_hdr_t h = {
         .seq = seq,
         .tick_ms = (uint32_t)tick_ms,
-        .len = raw_len > 0xFFFF ? 0xFFFF : (uint16_t)raw_len,
+        .len = len,
+        .raw_len = raw_len,
         .dir = dir,
+        .flags = 0,
         .reserved = 0,
     };
-    if (fwrite(&rec, 1, sizeof(rec), s_idx[dir]) != sizeof(rec)) {
-        sd_note_write_error(dir ? "tx" : "rx");
-        sd_unlock();
+    sd_q_write((const uint8_t *)&h, sizeof(h));
+    sd_q_write(data, len);
+    xSemaphoreGive(s_qlock);
+    if (s_qsig) {
+        xSemaphoreGive(s_qsig);
+    }
+    return true;
+}
+
+static void sd_writer_task(void *arg)
+{
+    (void)arg;
+    uint8_t *buf = (uint8_t *)malloc(CONFIG_BRIDGE_MAX_FRAME);
+    if (!buf) {
+        ESP_LOGE(TAG, "writer buffer alloc failed");
+        vTaskDelete(NULL);
         return;
     }
-    s_idx_count[dir]++;
-    if (s_first_seq == 0 || seq < s_first_seq) {
-        s_first_seq = seq;
+    for (;;) {
+        if (!s_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        sd_lock();
+        if (!s_mounted || s_broken) {
+            sd_unlock();
+            if (s_qsig) xSemaphoreTake(s_qsig, pdMS_TO_TICKS(1000));
+            else vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        sd_q_hdr_t h;
+        if (!sd_q_dequeue(&h, buf)) {
+            sd_unlock();
+            if (s_qsig) xSemaphoreTake(s_qsig, pdMS_TO_TICKS(1000));
+            else vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        const int dir = h.dir;
+        uint64_t off = s_raw_bytes[dir];
+        bool ok = fwrite(buf, 1, h.len, s_raw[dir]) == h.len;
+        if (ok && h.raw_len == (uint16_t)(h.len + 1)) {
+            ok = fputc('\n', s_raw[dir]) == '\n';
+        }
+        if (!ok) {
+            sd_note_write_error(dir ? "tx" : "rx");
+            sd_unlock();
+            continue;
+        }
+        s_raw_bytes[dir] += h.raw_len;
+        sd_idx_rec_t rec = {
+            .offset = off,
+            .seq = h.seq,
+            .tick_ms = h.tick_ms,
+            .len = h.raw_len,
+            .dir = (uint8_t)dir,
+            .reserved = 0,
+        };
+        if (fwrite(&rec, 1, sizeof(rec), s_idx[dir]) != sizeof(rec)) {
+            sd_note_write_error(dir ? "tx" : "rx");
+            sd_unlock();
+            continue;
+        }
+        s_idx_count[dir]++;
+        if (s_first_seq == 0 || h.seq < s_first_seq) s_first_seq = h.seq;
+        if (h.seq > s_last_seq) s_last_seq = h.seq;
+        const uint64_t seg_max = (uint64_t)CONFIG_BRIDGE_SD_SEGMENT_MAX_MB * 1024ULL * 1024ULL;
+        if (seg_max > 0 && s_raw_bytes[0] + s_raw_bytes[1] >= seg_max) {
+            sd_rotate_locked();
+        }
+        sd_unlock();
     }
-    if (seq > s_last_seq) {
-        s_last_seq = seq;
-    }
-    const uint64_t seg_max = (uint64_t)CONFIG_BRIDGE_SD_SEGMENT_MAX_MB * 1024ULL * 1024ULL;
-    if (seg_max > 0 && s_raw_bytes[0] + s_raw_bytes[1] >= seg_max) {
-        sd_rotate_locked();
-    }
-    sd_unlock();
 }
 
 void bridge_sd_get_status(bridge_sd_status_t *out)
@@ -804,6 +980,14 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
     }
     memset(out, 0, sizeof(*out));
     out->mounted = s_mounted;
+    if (s_qlock) {
+        xSemaphoreTake(s_qlock, portMAX_DELAY);
+        out->queue_bytes = s_qcap;
+        out->queue_used = s_qused;
+        out->queue_dropped = s_qdrop;
+        out->queue_dropped_bytes = s_qdrop_bytes;
+        xSemaphoreGive(s_qlock);
+    }
     if (!s_mounted) {
         return;
     }
@@ -911,6 +1095,7 @@ esp_err_t bridge_sd_clear(const char *segment, bool *active_cleared)
         if (strcmp(segment, s_id) == 0) {
             sd_close_segment_locked();
             sd_unlink_segment_locked(segment);
+            sd_q_reset();
             err = sd_create_segment_locked();
             if (active_cleared) {
                 *active_cleared = true;
@@ -921,6 +1106,7 @@ esp_err_t bridge_sd_clear(const char *segment, bool *active_cleared)
     } else {
         sd_close_segment_locked();
         sd_unlink_all_locked();
+        sd_q_reset();
         err = sd_create_segment_locked();
         if (active_cleared) {
             *active_cleared = true;

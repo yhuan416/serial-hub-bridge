@@ -29,7 +29,7 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 | `SET_LINES` | ✅（按接线） | RTS 走 UART，DTR 走普通 GPIO；未接线返回 `unsupported` |
 | `BREAK` | ✅（需实机确认） | `uart_write_bytes_with_break(size=0)` |
 | `PING` | ✅ | `t_ms` 回显 + `device_tick_ms` |
-| `LOG_STATS` | ✅ | ring 水位 + RAM/SD 统计、`segments[]`、`ram_*`/`sd_*` seq |
+| `LOG_STATS` | ✅ | ring/SD/RAM 统计、`segments[]`、`ram_*`/`sd_*` seq、health/queue/overflow 计数 |
 | `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor`；line/hex 受 `log_line_max` 截断 |
 | `LOG_CLEAR` | ✅ | 省略 `segment` 清所有段并重置 seq；指定段只清该段 |
 | `LOG_EXPORT` | ✅（需 SD） | 按 `segment` 导出 SD `raw+index`；省略导出活动段 |
@@ -67,6 +67,11 @@ I (2519) bridge_net: auth=on
 - **幂等**：`READ` 只读不消耗；`WRITE/TRANSACT` 支持 `op_id` 去重（32 条 / 60s，
   结果 ≤ 16 KiB 才缓存；重复请求返回首次结果并置 `deduped:true`）。
 - **背压**：ring 满丢最旧，`LOG_STATS.ring.dropped_bytes` 单调递增。
+- **UART/SD 解耦**：UART task 只写 4 MiB ring/RAM 日志，并把行/TX 写入 3 MiB PSRAM
+  queue；独立 writer task 做 raw+index。UART 不再等 SD/fsync。
+- **可观测丢失**：`uart.overflow`（UART 驱动缓冲溢出）、`sd.queue_drop`（PSRAM queue 满）、
+  `sd.write`/`sd.remount` 都会进 `EVENT_QUERY`，并在 `LOG_STATS` 计数。
+- **partial 行**：sync 周期会把未结束的 RX 行落成独立条目，避免一直等换行。
 
 ## 快速开始
 
@@ -141,6 +146,8 @@ LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
 ## SD 权威日志
 
 SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目录 `/sdcard/shb`。
+`LOG_STATS.sd_queue` 显示 UART→SD 队列水位；`uart_overflow_bytes`/`ring.dropped_bytes`
+是 UART/ring 侧丢失计数。默认 UART 驱动缓冲 32 KiB、SD queue 3 MiB（可 menuconfig 调整）。
 每次启动/重挂载会扫描已有 segment，**续写最新完整段**并恢复 seq；达到
 `CONFIG_BRIDGE_SD_SEGMENT_MAX_MB`（默认 3072）滚动新段，避免 FAT32 4 GiB 单文件上限。
 `LOG_STATS.segments[]` 列出全部段，旧段可按 `segment` 导出/清理。
@@ -214,6 +221,8 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --toke
 | `BRIDGE_UART_RTS_GPIO` / `CTS_GPIO` / `DTR_GPIO` | -1 | -1 = 未接线 |
 | `BRIDGE_UART_BAUD` | 1500000（当前卡片机；旧摄像头 921600；Kconfig 兜底 115200） | CONFIG 可运行时改 |
 | `BRIDGE_RING_BYTES` | 4194304 | 4 MiB PSRAM ring；1.5M 满速约 27 s |
+| `BRIDGE_UART_RX_BUF` | 32768 | UART 驱动缓冲；吸收短 CPU/Wi‑Fi 停顿 |
+| `BRIDGE_SD_QUEUE_BYTES` | 3145728 | UART→SD writer PSRAM queue；1.5M 约 16 s |
 | `BRIDGE_MAX_FRAME` | 32768 | 同时限制 `READ.max_bytes` |
 | `BRIDGE_MAX_HOLD_MS` | 10000 | 超过被 clamp 并回 `hold_clamped` |
 | `BRIDGE_LOG_ENTRIES` | 256 | 0 = 关闭 RAM 行日志 |
@@ -230,8 +239,8 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --toke
 | `BRIDGE_BUTTON_ENABLE` | y | GPIO0 长按恢复出厂配网 |
 | `BRIDGE_BUTTON_LONG_PRESS_MS` | 5000 | 长按阈值 |
 
-内存粗略：ring（默认 4 MiB，PSRAM）+ 行日志（256 × (192+40) ≈ 58 KiB）+ 部分行 1 KiB
-+ 响应 scratch 32 KiB + 运行时 base64/JSON 峰值。无 PSRAM 的 S3 建议把
+内存粗略：ring（默认 4 MiB，PSRAM）+ SD queue（3 MiB，PSRAM）+ 行日志（256 × (192+40) ≈
+58 KiB）+ 部分行 1 KiB + 响应 scratch 32 KiB + 运行时 base64/JSON 峰值。无 PSRAM 的 S3 建议把
 `BRIDGE_RING_BYTES` 降到 128 KiB、`BRIDGE_MAX_FRAME` 降到 16 KiB；无 PSRAM 时 4 MiB 会自动回退内部 RAM 并可能失败。
 
 ## 主机侧纯逻辑测试

@@ -130,6 +130,18 @@ menu "serial-hub-bridge"
                 FAT32 has a 4 GiB per-file limit. Rotate before that; old
                 segments remain visible in LOG_STATS and exportable by id.
 
+        config BRIDGE_SD_QUEUE_BYTES
+            int "PSRAM queue between UART and SD writer (bytes)"
+            default 3145728
+            range 65536 4194304
+            depends on BRIDGE_SD_ENABLE
+            help
+                UART never performs FAT I/O. RX lines/TX writes are copied into
+                this queue and a lower-priority task writes raw+index. If the
+                queue fills, bytes are counted/dropped (sd.queue_drop) instead
+                of blocking the UART and causing FIFO overflow. 3 MiB absorbs
+                ~16 s at 1.5 Mbit/s.
+
     endmenu
 
     menu "UART"
