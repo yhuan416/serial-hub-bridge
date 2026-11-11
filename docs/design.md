@@ -128,6 +128,8 @@ READ(from_offset = barrier)
 - UART RX/TX 双写；默认 1 s `fsync`；按目录总大小保留（`BRIDGE_SD_RETAIN_MB`）。
 - `LOG_STATS` 读 SD 容量/已用/segment/raw/index/earliest/latest；
   `LOG_EXPORT` 按 `dir/seq_from/cursor/max_bytes` 分页返回 raw + index。
+- `cursor` 是**索引记录序号**；首屏按 `seq_from` 二分定位，之后 64 条/块读；
+  页 32 KiB/512 行，避免每次从头逐条扫描。
 - 无卡 → `log_storage:"ram"`、`log_export:false`，行为回退到 RAM 窗口。
 
 实测（921600 摄像头、90 s 不读 TCP）：SD raw +472,149 B / +6,296 行，同时 RAM ring
@@ -154,7 +156,8 @@ READ(from_offset = barrier)
 - `max_frame` 默认 32 KiB：响应要走 base64（×4/3）+ cJSON 字符串，64 KiB 帧在无 PSRAM
   的板子上峰值偏高。
 - `READ` 的 `max_bytes` 被 `max_frame` 夹住；`scratch` 在启动时一次性分配。
-- 115200 无压力；921600 建议 ring ≥ 256 KiB；1.5 M 建议 PSRAM + 1 MiB ring。
+- 115200 无压力；921600 建议 ring ≥ 256 KiB；1.5 M 满速约 150 KB/s，256 KiB ring 只覆盖
+  ~1.7 s，必须 SD/持续 drain（或 PSRAM ring ≥ 1 MiB）。
 
 ## 11. 测试策略
 
@@ -168,7 +171,8 @@ READ(from_offset = barrier)
    （CONFIG 早期失败是 `uart_set_hw_flow_ctrl` 阈值 128 越界，已改 0/127。）
    接摄像头后确认目标为 **921600 8N1**：8 s 抓 31,834 B、97% 可打印、0 个非法 UTF-8；
    `LOG_QUERY` 返回 `stcloud_init_camera ... frame no` / `ai detect` / `CPU Usage` 等行。
-   1500000/2000000 为乱码。
+   旧摄像头在 1500000/2000000 为乱码。新卡片机 WiFi 侧为 1,500,000：10 s 14.2 KiB / 228 行、
+   97.5% 可打印（XMWEI/WDG_HAL/KEEPALIVE），板级默认已改 1500000。
    SD：32 GB 卡 FAT 挂载成功；90 s 空闲窗口 SD 增长 472 KB / 6,296 行，期间 ring
    已满并累计丢弃 1.3 MB；`LOG_EXPORT` 回读的 frame no 连续。
 4. **裸协议冒烟**（脚本已验证）：`tools/smoke.mjs`（纯 Node）对真实设备跑

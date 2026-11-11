@@ -145,7 +145,8 @@ RAM ring used=262,144 (满)   dropped=1,306,717
 
 即 ring 已经覆盖不下，但 SD 完整保留了这 90 s；导出内容是可读的
 `[stcloud_init_camera] ... frame no` 文本。当前限制：只导出**本次启动的 segment**、
-导出速度受 WiFi/视频上传影响（约 2.5 s / 16 KB 页）、时间仍是 uptime（无 NTP）。
+导出页 32 KB/512 行；cursor 是索引序号，首屏按 seq 二分定位，之后 64 条/块读，
+通常 <1 s/页（WiFi 拥塞时会慢）。时间仍是 uptime（无 NTP）。
 
 ## 与主机联调
 
@@ -157,11 +158,11 @@ npm install && npm test          # 62 项，含 fake bridge
 npx serial-hub-mcp               # 或 node src/server.js
 ```
 
-MCP 工具调用示例（`endpoint` 指向设备 IP；本机摄像头目标为 **921600 8N1**）：
+MCP 工具调用示例（`endpoint` 指向设备 IP；波特率按目标传：旧摄像头 921600，当前卡片机 **1500000**）：
 
 ```text
 open({ transport: "remote", endpoint: "tcp://192.168.1.50:7000",
-       baud_rate: 921600, token: "<token>" })
+       baud_rate: 1500000, token: "<token>" })
 transact({ connection_id: "...", data: "AT", newline: "crlf", match: "OK", timeout_ms: 2000 })
 receive({ connection_id: "...", start: "flush", budget_ms: 3000, idle_timeout_ms: 300 })
 get_status({ connection_id: "..." })     # remote.caps / gap_count / fw_version
@@ -172,7 +173,7 @@ close({ connection_id: "..." })
 不装 MCP 也能做裸协议冒烟（纯 Node，无依赖）：
 
 ```bash
-node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 921600 --no-transact --token <token>
+node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --token <token>
 ```
 
 它会依次跑 `HELLO → CONFIG → WRITE/READ → TRANSACT → LOG_STATS → CLOSE` 并断言字段。
@@ -188,7 +189,7 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 921600 --no-transact --token
 | `BRIDGE_UART_NUM` | 1 | |
 | `BRIDGE_UART_TX_GPIO` / `RX_GPIO` | 17 / 18 | |
 | `BRIDGE_UART_RTS_GPIO` / `CTS_GPIO` / `DTR_GPIO` | -1 | -1 = 未接线 |
-| `BRIDGE_UART_BAUD` | 115200 | CONFIG 可运行时改 |
+| `BRIDGE_UART_BAUD` | 1500000（当前卡片机；旧摄像头 921600；Kconfig 兜底 115200） | CONFIG 可运行时改 |
 | `BRIDGE_RING_BYTES` | 262144 | ≥1 MiB 建议开 PSRAM |
 | `BRIDGE_MAX_FRAME` | 32768 | 同时限制 `READ.max_bytes` |
 | `BRIDGE_MAX_HOLD_MS` | 10000 | 超过被 clamp 并回 `hold_clamped` |
@@ -230,7 +231,7 @@ node tools/smoke.mjs tcp://<device-ip>:7000 --no-transact
 HELLO / CONFIG / WRITE / READ / LOG_STATS / PING / CLOSE 全部通过。
 （`CONFIG` 曾因 `uart_set_hw_flow_ctrl` 阈值给了 128 返回 ESP_FAIL，已改为 0/127。）
 
-接上摄像头后确认目标波特率为 **921600 8N1**：8 秒抓到 31,834 B，可打印率 97%、
+旧摄像头确认 **921600 8N1**：8 秒抓到 31,834 B，可打印率 97%、
 UTF-8 非法 0；`LOG_QUERY` 能解析出：
 
 ```
@@ -239,8 +240,10 @@ ai detect ret:0 cnt:0 ch:0 w:416 h:224 ...
 CPU Usage: 41%
 ```
 
-1500000 / 2000000 下是乱码。`TRANSACT` 需要目标能应答；当前摄像头是持续日志，
-用 `--no-transact`。host 侧 `open` 记得带 `baud_rate: 921600`（或存 profile）。
+旧摄像头在 1500000 / 2000000 下是乱码。新卡片机 WiFi 侧为 **1,500,000 8N1**：
+10 秒 14.2 KiB / 228 行、97.5% 可打印（`XMWEI`/`WDG_HAL`/`KEEPALIVE`/电池），板级默认已改为 1500000。
+`TRANSACT` 需要目标能应答；当前是持续日志，用 `--no-transact`。host 侧 `open` 按目标传
+`baud_rate`（旧摄像头 921600，卡片机 1500000）或存 profile。
 
 SD 已实机验证：32 GB 卡格式化/FAT 挂载成功，`LOG_STATS` 显示 31 GB、`raw+index`；
 TX 的 `LOG_EXPORT` 精确回读；90 s 空闲窗口 SD 增长 472 KB / 6,296 行，同时 ring

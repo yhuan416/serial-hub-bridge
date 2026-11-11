@@ -7,7 +7,7 @@
 //   --dir rx|tx          default rx
 //   --seq-from <n>       first seq (default: earliest)
 //   --out <path>         output text file (default /tmp/serial-hub-export-<epoch>.log)
-//   --max-bytes <n>      per page, clamp 16384 (default 16384)
+//   --max-bytes <n>      per page, clamp 32768 (default 32768)
 //   --token <t>          HELLO token
 //
 // LOG_EXPORT reads the device SD log only; it never sends CONFIG, so it does
@@ -22,7 +22,7 @@ function parseArgs(argv) {
     dir: "rx",
     seqFrom: null,
     out: `/tmp/serial-hub-export-${Date.now()}.log`,
-    maxBytes: 16384,
+    maxBytes: 32768,
     token: null,
     statsOnly: false,
   };

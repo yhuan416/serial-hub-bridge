@@ -27,8 +27,8 @@
 #define TAG "bridge_sd"
 
 #define SD_DIR CONFIG_BRIDGE_SD_MOUNT_POINT "/shb"
-#define EXPORT_CHUNK_MAX 16384
-#define EXPORT_LINES_MAX 256
+#define EXPORT_CHUNK_MAX 32768
+#define EXPORT_LINES_MAX 512
 #define RETENTION_EVERY 60
 
 static SemaphoreHandle_t s_lock;
@@ -411,6 +411,41 @@ esp_err_t bridge_sd_clear(void)
     return err;
 }
 
+static uint32_t sd_idx_record_count(FILE *f)
+{
+    if (fseek(f, 0, SEEK_END) != 0) {
+        return 0;
+    }
+    long sz = ftell(f);
+    if (sz < 0) {
+        return 0;
+    }
+    return (uint32_t)(sz / (long)sizeof(sd_idx_rec_t));
+}
+
+static bool sd_idx_read(FILE *f, uint32_t index, sd_idx_rec_t *rec)
+{
+    if (fseek(f, (long)index * (long)sizeof(*rec), SEEK_SET) != 0) {
+        return false;
+    }
+    return fread(rec, 1, sizeof(*rec), f) == sizeof(*rec);
+}
+
+static uint32_t sd_idx_lower_bound(FILE *f, uint32_t n, uint32_t seq)
+{
+    uint32_t lo = 0, hi = n;
+    sd_idx_rec_t rec;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (sd_idx_read(f, mid, &rec) && rec.seq < seq) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t *out)
 {
     if (!req || !out) {
@@ -458,33 +493,67 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
     uint64_t start_off = 0, end_off = 0;
     uint32_t count = 0;
     bool more = false;
+    uint32_t next_index = 0;
 
-    sd_idx_rec_t rec;
-    while (fread(&rec, 1, sizeof(rec), idx) == sizeof(rec)) {
-        if (rec.dir != dir) {
-            continue;
-        }
-        if (req->has_seq_from && rec.seq < req->seq_from) {
-            continue;
-        }
-        if (req->has_seq_to && rec.seq > req->seq_to) {
-            continue;
-        }
-        if (rec.offset < req->cursor || rec.len == 0) {
-            continue;
-        }
-        uint64_t end = rec.offset + rec.len;
-        if (end > raw_size) {
-            continue; /* tail not flushed yet */
-        }
-        if (count == 0) {
-            start_off = rec.offset;
-        } else if (end - start_off > max_bytes || count >= EXPORT_LINES_MAX) {
-            more = true;
+    const uint32_t nrec = sd_idx_record_count(idx);
+    uint32_t start_index = 0;
+    if (req->cursor > 0) {
+        start_index = req->cursor > nrec ? nrec : (uint32_t)req->cursor;
+    } else if (req->has_seq_from) {
+        start_index = sd_idx_lower_bound(idx, nrec, req->seq_from);
+    }
+    if (start_index > nrec) {
+        start_index = nrec;
+    }
+    if (fseek(idx, (long)start_index * (long)sizeof(sd_idx_rec_t), SEEK_SET) != 0) {
+        fclose(idx);
+        fclose(raw);
+        free(recs);
+        sd_unlock();
+        return ESP_FAIL;
+    }
+
+    enum { IDX_BLOCK = 64 };
+    sd_idx_rec_t block[IDX_BLOCK];
+    uint32_t rec_index = start_index;
+    bool stop = false;
+    while (!stop) {
+        size_t got = fread(block, sizeof(sd_idx_rec_t), IDX_BLOCK, idx);
+        if (got == 0) {
             break;
         }
-        recs[count++] = rec;
-        end_off = end;
+        for (size_t k = 0; k < got; k++) {
+            sd_idx_rec_t rec = block[k];
+            uint32_t this_index = rec_index;
+            rec_index++;
+            if (rec.dir != dir) {
+                continue;
+            }
+            if (req->has_seq_to && rec.seq > req->seq_to) {
+                stop = true; /* per-dir index is seq-ordered */
+                break;
+            }
+            if (req->has_seq_from && rec.seq < req->seq_from) {
+                continue;
+            }
+            if (rec.len == 0) {
+                continue;
+            }
+            uint64_t end = rec.offset + rec.len;
+            if (end > raw_size) {
+                continue; /* tail not flushed yet */
+            }
+            if (count == 0) {
+                start_off = rec.offset;
+            } else if (end - start_off > max_bytes || count >= EXPORT_LINES_MAX) {
+                more = true;
+                next_index = this_index;
+                stop = true;
+                break;
+            }
+            recs[count++] = rec;
+            end_off = end;
+        }
     }
     fclose(idx);
 
@@ -530,7 +599,7 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
     out->chunk_len = chunk_len;
     out->index = index;
     out->index_len = sizeof(sd_idx_rec_t) * count;
-    out->next_cursor = end_off;
+    out->next_cursor = more ? next_index : 0;
     out->eof = !more;
 
     free(recs);
