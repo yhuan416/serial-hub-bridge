@@ -11,6 +11,7 @@
 
 #include "bridge_port.h"
 #include "bridge_sd.h"
+#include "bridge_event.h"
 
 #define TAG "bridge_proto"
 
@@ -328,6 +329,7 @@ static cJSON *build_caps(bridge_ctx_t *ctx)
     cJSON_AddItemToArray(lf, cJSON_CreateString("seq"));
     cJSON_AddItemToArray(lf, cJSON_CreateString("dir"));
 
+    cJSON_AddBoolToObject(caps, "events", true);
     cJSON_AddStringToObject(caps, "log_storage", has_sd ? "raw+index" : "ram");
     cJSON_AddBoolToObject(caps, "log_export", has_sd);
     cJSON_AddBoolToObject(caps, "binary_frames", false);
@@ -775,6 +777,8 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
         cJSON_AddNumberToObject(r, "raw_bytes", (double)sd.raw_bytes);
         cJSON_AddNumberToObject(r, "index_count", (double)sd.index_count);
     }
+    cJSON_AddNumberToObject(r, "sd_write_errors", (double)sd.write_errors);
+    cJSON_AddBoolToObject(r, "sd_broken", sd.broken);
 
     cJSON *ring = cJSON_AddObjectToObject(r, "ring");
     cJSON_AddNumberToObject(ring, "bytes", (double)st.ring_capacity);
@@ -926,6 +930,85 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     return make_ok(id, r);
 }
 
+static char *handle_event_query(bridge_ctx_t *ctx, const cJSON *msg)
+{
+    (void)ctx;
+    const cJSON *id = jid(msg);
+    uint32_t seq_from = 1;
+    uint32_t limit = 100;
+    ju32(msg, "seq_from", &seq_from);
+    if (ju32(msg, "limit", &limit)) {
+        if (limit == 0) {
+            limit = 100;
+        }
+        if (limit > 256) {
+            limit = 256;
+        }
+    }
+    const char *level = jstr(msg, "level");
+    int level_filter = -1;
+    if (level) {
+        if (strcmp(level, "info") == 0) {
+            level_filter = BRIDGE_EVENT_INFO;
+        } else if (strcmp(level, "warn") == 0) {
+            level_filter = BRIDGE_EVENT_WARN;
+        } else if (strcmp(level, "error") == 0) {
+            level_filter = BRIDGE_EVENT_ERROR;
+        } else {
+            return make_err(id, "bad_request", "level must be info|warn|error");
+        }
+    }
+
+    bridge_event_t *evs = (bridge_event_t *)malloc(sizeof(bridge_event_t) * 256);
+    if (!evs) {
+        return make_err(id, "io_error", "OOM");
+    }
+    uint32_t n = bridge_event_query(seq_from, limit, evs, 256);
+    cJSON *arr = cJSON_CreateArray();
+    uint32_t count = 0;
+    uint32_t last_seq = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (level_filter >= 0 && evs[i].level != (uint8_t)level_filter) {
+            continue;
+        }
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "seq", evs[i].seq);
+        cJSON_AddNumberToObject(e, "ts", (double)evs[i].ts_ms);
+        const char *lname = evs[i].level == BRIDGE_EVENT_ERROR
+                                ? "error"
+                                : (evs[i].level == BRIDGE_EVENT_WARN ? "warn" : "info");
+        cJSON_AddStringToObject(e, "level", lname);
+        cJSON_AddStringToObject(e, "code", evs[i].code);
+        cJSON_AddStringToObject(e, "msg", evs[i].msg);
+        cJSON_AddItemToArray(arr, e);
+        count++;
+        last_seq = evs[i].seq;
+    }
+    free(evs);
+
+    uint32_t earliest = 0;
+    bool has_earliest = bridge_event_earliest(&earliest);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddItemToObject(r, "events", arr);
+    cJSON_AddNumberToObject(r, "count", count);
+    if (has_earliest) {
+        cJSON_AddNumberToObject(r, "earliest_seq", earliest);
+    } else {
+        cJSON_AddNullToObject(r, "earliest_seq");
+    }
+    cJSON_AddNumberToObject(r, "latest_seq", (double)bridge_event_latest());
+    if (count) {
+        char cur[24];
+        snprintf(cur, sizeof(cur), "%lu", (unsigned long)last_seq);
+        cJSON_AddStringToObject(r, "next_cursor", cur);
+    } else {
+        cJSON_AddNullToObject(r, "next_cursor");
+    }
+    cJSON_AddStringToObject(r, "source", "device");
+    cJSON_AddStringToObject(r, "time_source", "tick");
+    return make_ok(id, r);
+}
+
 static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
 {
     const cJSON *id = jid(msg);
@@ -1068,6 +1151,11 @@ char *bridge_proto_handle(bridge_ctx_t *ctx,
         if (close_after) {
             *close_after = true;
         }
+        goto done;
+    }
+
+    if (strcmp(op, "EVENT_QUERY") == 0) {
+        out = handle_event_query(ctx, msg);
         goto done;
     }
 

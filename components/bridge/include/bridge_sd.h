@@ -38,6 +38,8 @@ typedef struct {
     uint64_t free_bytes;
     uint64_t raw_bytes;   /* current segment */
     uint32_t index_count; /* current segment */
+    uint32_t write_errors;
+    bool broken;
     uint32_t earliest_seq;
     uint32_t latest_seq;
     char segment[40];

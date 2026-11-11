@@ -12,6 +12,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "bridge_event.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -34,8 +35,15 @@
 static SemaphoreHandle_t s_lock;
 static sdmmc_card_t *s_card;
 static esp_timer_handle_t s_timer;
-static bool s_mounted;
+static esp_timer_handle_t s_retry_timer;
+static volatile bool s_mounted;
+static volatile bool s_broken;
 static bool s_sync_error;
+static bool s_enabled;
+static bool s_bus_ready;
+static uint32_t s_write_errors;
+static uint32_t s_mount_fail_count;
+static uint32_t s_last_write_event_ms;
 
 static char s_id[32];
 static char s_path[4][96]; /* raw_rx, idx_rx, raw_tx, idx_tx */
@@ -46,6 +54,9 @@ static uint32_t s_idx_count[2];
 static uint32_t s_first_seq;
 static uint32_t s_last_seq;
 static uint32_t s_sync_ticks;
+
+static esp_err_t sd_try_mount(int attempts);
+static void sd_remount(void);
 
 static void sd_lock(void)
 {
@@ -68,8 +79,10 @@ static void sd_fsync(FILE *f)
     }
     fflush(f);
     if (fsync(fileno(f)) != 0 && !s_sync_error) {
-        ESP_LOGW(TAG, "fsync failed (data still buffered in FAT)");
         s_sync_error = true;
+        ESP_LOGW(TAG, "fsync failed (data still buffered in FAT)");
+        bridge_event_push(BRIDGE_EVENT_WARN, "sd.sync",
+                          "fsync failed; data may remain in FAT cache");
     }
 }
 
@@ -158,6 +171,9 @@ static void sd_retention_locked(void)
         snprintf(full, sizeof(full), "%s/%.63s", SD_DIR, ents[oldest].name);
         ESP_LOGI(TAG, "retention: remove %s (%llu KiB)", full,
                  (unsigned long long)(ents[oldest].size / 1024));
+        bridge_event_push(BRIDGE_EVENT_INFO, "sd.retention",
+                          "removed %.63s (%llu KiB)", ents[oldest].name,
+                          (unsigned long long)(ents[oldest].size / 1024));
         unlink(full);
         total -= ents[oldest].size;
         ents[oldest].deleted = true;
@@ -192,37 +208,22 @@ static esp_err_t sd_open_segment_locked(void)
     return ESP_OK;
 }
 
-static void sd_sync_timer(void *arg)
-{
-    (void)arg;
-    sd_lock();
-    for (int i = 0; i < 2; i++) {
-        sd_fsync(s_raw[i]);
-        sd_fsync(s_idx[i]);
-    }
-    if (++s_sync_ticks % RETENTION_EVERY == 0) {
-        sd_retention_locked();
-    }
-    sd_unlock();
-}
-
-esp_err_t bridge_sd_init(bool spi_bus_ready)
+static esp_err_t sd_try_mount(int attempts)
 {
 #if !CONFIG_BRIDGE_SD_ENABLE
-    ESP_LOGI(TAG, "disabled by Kconfig");
     return ESP_ERR_NOT_SUPPORTED;
 #else
+    if (!s_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    sd_lock();
     if (s_mounted) {
+        sd_unlock();
         return ESP_OK;
     }
-    s_lock = xSemaphoreCreateMutex();
-    if (!s_lock) {
-        return ESP_ERR_NO_MEM;
-    }
+    sd_unlock();
 
-    if (!spi_bus_ready) {
-        /* The LCD normally initializes SPI2 first; if it is disabled or
-         * failed, make sure the bus exists with the same pins. */
+    if (!s_bus_ready) {
         spi_bus_config_t buscfg = {
             .sclk_io_num = 12,
             .mosi_io_num = 11,
@@ -232,7 +233,8 @@ esp_err_t bridge_sd_init(bool spi_bus_ready)
             .max_transfer_sz = 160 * 80 * 2,
         };
         esp_err_t bus_err = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-        if (bus_err != ESP_OK && bus_err != ESP_ERR_INVALID_STATE) {
+        s_bus_ready = (bus_err == ESP_OK || bus_err == ESP_ERR_INVALID_STATE);
+        if (!s_bus_ready) {
             ESP_LOGW(TAG, "SPI2 init: %s", esp_err_to_name(bus_err));
         }
     }
@@ -252,7 +254,7 @@ esp_err_t bridge_sd_init(bool spi_bus_ready)
     };
 
     esp_err_t err = ESP_FAIL;
-    for (int attempt = 0; attempt < 5; attempt++) {
+    for (int attempt = 0; attempt < attempts; attempt++) {
         if (attempt) {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
@@ -260,10 +262,17 @@ esp_err_t bridge_sd_init(bool spi_bus_ready)
         if (err == ESP_OK) {
             break;
         }
-        ESP_LOGW(TAG, "SD mount attempt %d/5 failed: %s", attempt + 1, esp_err_to_name(err));
+        ESP_LOGW(TAG, "SD mount attempt %d/%d failed: %s", attempt + 1, attempts,
+                 esp_err_to_name(err));
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SD mount failed: %s (RAM-only mode)", esp_err_to_name(err));
+        s_card = NULL;
+        s_mount_fail_count++;
+        if (s_mount_fail_count == 1 || s_mount_fail_count % 10 == 0) {
+            bridge_event_push(BRIDGE_EVENT_WARN, "sd.mount",
+                              "mount failed (%lu): %s", (unsigned long)s_mount_fail_count,
+                              esp_err_to_name(err));
+        }
         return err;
     }
 
@@ -272,32 +281,144 @@ esp_err_t bridge_sd_init(bool spi_bus_ready)
     }
 
     sd_lock();
+    if (s_mounted) {
+        sd_unlock();
+        return ESP_OK;
+    }
     sd_retention_locked();
     err = sd_open_segment_locked();
+    if (err == ESP_OK) {
+        s_mounted = true;
+        s_broken = false;
+        s_mount_fail_count = 0;
+    }
     sd_unlock();
+
     if (err != ESP_OK) {
         esp_vfs_fat_sdcard_unmount(CONFIG_BRIDGE_SD_MOUNT_POINT, s_card);
         s_card = NULL;
+        bridge_event_push(BRIDGE_EVENT_ERROR, "sd.mount",
+                          "open segment failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    const esp_timer_create_args_t targs = {
+    uint64_t total = 0, freeb = 0;
+    esp_vfs_fat_info(CONFIG_BRIDGE_SD_MOUNT_POINT, &total, &freeb);
+    ESP_LOGI(TAG, "mounted at %s, %.1f/%.1f MiB free, dir=%s, seg=%s",
+             CONFIG_BRIDGE_SD_MOUNT_POINT, (double)freeb / 1048576.0,
+             (double)total / 1048576.0, SD_DIR, s_id);
+    bridge_event_push(BRIDGE_EVENT_INFO, "sd.mount",
+                      "mounted seg=%s free=%.1f/%.1f MiB", s_id,
+                      (double)freeb / 1048576.0, (double)total / 1048576.0);
+    return ESP_OK;
+#endif
+}
+
+static void sd_remount(void)
+{
+    sd_lock();
+    if (!s_mounted && !s_card) {
+        sd_unlock();
+        return;
+    }
+    sd_close_segment_locked();
+    sdmmc_card_t *card = s_card;
+    s_card = NULL;
+    s_mounted = false;
+    s_broken = false;
+    uint32_t errors = s_write_errors;
+    sd_unlock();
+
+    if (card) {
+        esp_err_t err = esp_vfs_fat_sdcard_unmount(CONFIG_BRIDGE_SD_MOUNT_POINT, card);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "unmount: %s", esp_err_to_name(err));
+        }
+    }
+    bridge_event_push(BRIDGE_EVENT_WARN, "sd.remount",
+                      "unmounted after %lu write errors; retrying",
+                      (unsigned long)errors);
+    if (s_retry_timer) {
+        esp_timer_start_once(s_retry_timer, 1000000ULL);
+    }
+}
+
+static void sd_retry_cb(void *arg)
+{
+    (void)arg;
+    if (!s_enabled || s_mounted) {
+        return;
+    }
+    if (sd_try_mount(1) != ESP_OK && s_retry_timer) {
+        esp_timer_start_once(s_retry_timer, 10000000ULL);
+    }
+}
+
+static void sd_sync_timer(void *arg)
+{
+    (void)arg;
+    if (!s_enabled || !s_mounted) {
+        return;
+    }
+    if (s_broken) {
+        sd_remount();
+        return;
+    }
+    sd_lock();
+    for (int i = 0; i < 2; i++) {
+        sd_fsync(s_raw[i]);
+        sd_fsync(s_idx[i]);
+    }
+    if (++s_sync_ticks % RETENTION_EVERY == 0) {
+        sd_retention_locked();
+    }
+    sd_unlock();
+}
+
+esp_err_t bridge_sd_init(bool spi_bus_ready)
+{
+#if !CONFIG_BRIDGE_SD_ENABLE
+    ESP_LOGI(TAG, "disabled by Kconfig");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    if (s_enabled) {
+        return s_mounted ? ESP_OK : ESP_FAIL;
+    }
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_enabled = true;
+    s_bus_ready = spi_bus_ready;
+
+    const esp_timer_create_args_t sync_args = {
         .callback = sd_sync_timer,
         .name = "sdlog_sync",
     };
-    if (esp_timer_create(&targs, &s_timer) == ESP_OK) {
+    if (esp_timer_create(&sync_args, &s_timer) == ESP_OK) {
         esp_timer_start_periodic(s_timer, (uint64_t)CONFIG_BRIDGE_SD_SYNC_MS * 1000ULL);
     } else {
         ESP_LOGW(TAG, "sync timer create failed");
     }
 
-    s_mounted = true;
-    uint64_t total = 0, freeb = 0;
-    esp_vfs_fat_info(CONFIG_BRIDGE_SD_MOUNT_POINT, &total, &freeb);
-    ESP_LOGI(TAG, "mounted at %s, %.1f/%.1f MiB free, dir=%s",
-             CONFIG_BRIDGE_SD_MOUNT_POINT, (double)freeb / 1048576.0,
-             (double)total / 1048576.0, SD_DIR);
-    return ESP_OK;
+    const esp_timer_create_args_t retry_args = {
+        .callback = sd_retry_cb,
+        .name = "sdlog_retry",
+    };
+    if (esp_timer_create(&retry_args, &s_retry_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "retry timer create failed; no hot-plug retry");
+        s_retry_timer = NULL;
+    }
+
+    esp_err_t err = sd_try_mount(5);
+    if (err != ESP_OK) {
+        bridge_event_push(BRIDGE_EVENT_WARN, "sd.mount",
+                          "not mounted; RAM-only, retrying every 10s");
+        if (s_retry_timer) {
+            esp_timer_start_once(s_retry_timer, 10000000ULL);
+        }
+    }
+    return err;
 #endif
 }
 
@@ -308,10 +429,11 @@ bool bridge_sd_ready(void)
 
 void bridge_sd_sync(void)
 {
-    if (!s_mounted) {
+    sd_lock();
+    if (!s_mounted || s_broken) {
+        sd_unlock();
         return;
     }
-    sd_lock();
     for (int i = 0; i < 2; i++) {
         sd_fsync(s_raw[i]);
         sd_fsync(s_idx[i]);
@@ -319,26 +441,51 @@ void bridge_sd_sync(void)
     sd_unlock();
 }
 
+static void sd_note_write_error(const char *dir)
+{
+    s_write_errors++;
+    s_broken = true;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (s_last_write_event_ms == 0 || now - s_last_write_event_ms >= 5000) {
+        s_last_write_event_ms = now;
+        bridge_event_push(BRIDGE_EVENT_ERROR, "sd.write",
+                          "%s fwrite failed; remount pending (errors=%lu)", dir,
+                          (unsigned long)s_write_errors);
+    }
+}
+
 void bridge_sd_log_rx(const uint8_t *data, size_t len)
 {
-    if (!s_mounted || !data || len == 0) {
+    if (!data || len == 0) {
         return;
     }
     sd_lock();
-    if (s_raw[0] && fwrite(data, 1, len, s_raw[0]) == len) {
+    if (!s_mounted || s_broken || !s_raw[0]) {
+        sd_unlock();
+        return;
+    }
+    if (fwrite(data, 1, len, s_raw[0]) == len) {
         s_raw_bytes[0] += len;
+    } else {
+        sd_note_write_error("rx");
     }
     sd_unlock();
 }
 
 void bridge_sd_log_tx(const uint8_t *data, size_t len)
 {
-    if (!s_mounted || !data || len == 0) {
+    if (!data || len == 0) {
         return;
     }
     sd_lock();
-    if (s_raw[1] && fwrite(data, 1, len, s_raw[1]) == len) {
+    if (!s_mounted || s_broken || !s_raw[1]) {
+        sd_unlock();
+        return;
+    }
+    if (fwrite(data, 1, len, s_raw[1]) == len) {
         s_raw_bytes[1] += len;
+    } else {
+        sd_note_write_error("tx");
     }
     sd_unlock();
 }
@@ -346,7 +493,7 @@ void bridge_sd_log_tx(const uint8_t *data, size_t len)
 void bridge_sd_index_line(uint32_t seq, int64_t tick_ms, uint8_t dir,
                           uint64_t offset, uint32_t raw_len)
 {
-    if (!s_mounted || dir > 1 || raw_len == 0) {
+    if (dir > 1 || raw_len == 0) {
         return;
     }
     sd_idx_rec_t rec = {
@@ -358,14 +505,20 @@ void bridge_sd_index_line(uint32_t seq, int64_t tick_ms, uint8_t dir,
         .reserved = 0,
     };
     sd_lock();
-    if (s_idx[dir] && fwrite(&rec, 1, sizeof(rec), s_idx[dir]) == sizeof(rec)) {
-        s_idx_count[dir]++;
-        if (s_first_seq == 0 || seq < s_first_seq) {
-            s_first_seq = seq;
+    if (!s_mounted || s_broken || !s_idx[dir] ||
+        fwrite(&rec, 1, sizeof(rec), s_idx[dir]) != sizeof(rec)) {
+        if (s_mounted && !s_broken) {
+            sd_note_write_error(dir ? "tx" : "rx");
         }
-        if (seq > s_last_seq) {
-            s_last_seq = seq;
-        }
+        sd_unlock();
+        return;
+    }
+    s_idx_count[dir]++;
+    if (s_first_seq == 0 || seq < s_first_seq) {
+        s_first_seq = seq;
+    }
+    if (seq > s_last_seq) {
+        s_last_seq = seq;
     }
     sd_unlock();
 }
@@ -389,6 +542,8 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
     }
     out->raw_bytes = s_raw_bytes[0] + s_raw_bytes[1];
     out->index_count = s_idx_count[0] + s_idx_count[1];
+    out->write_errors = s_write_errors;
+    out->broken = s_broken;
     out->earliest_seq = s_first_seq;
     out->latest_seq = s_last_seq;
     snprintf(out->segment, sizeof(out->segment), "%s", s_id);

@@ -1,5 +1,6 @@
 #include "bridge_port.h"
 #include "bridge.h"
+#include "bridge_event.h"
 #include "bridge_sd.h"
 
 #include <stdlib.h>
@@ -49,6 +50,7 @@ struct bridge_port {
 
     int dtr;
     int rts;
+    uint32_t last_drop_event_ms;
 };
 
 uint64_t bridge_now_ms(void)
@@ -198,7 +200,18 @@ static void port_ingest(bridge_port_t *p, const uint8_t *data, size_t len)
     }
     xSemaphoreTake(p->lock, portMAX_DELAY);
     uint64_t base = p->ring.end;
+    uint64_t dropped_before = p->ring.dropped;
     bridge_ring_append(&p->ring, data, len);
+    if (p->ring.dropped > dropped_before) {
+        uint32_t now = (uint32_t)bridge_now_ms();
+        if (p->last_drop_event_ms == 0 || now - p->last_drop_event_ms >= 10000) {
+            p->last_drop_event_ms = now;
+            bridge_event_push(BRIDGE_EVENT_WARN, "ring.drop",
+                              "dropped %llu bytes (cap %zu, total %llu)",
+                              (unsigned long long)(p->ring.dropped - dropped_before),
+                              p->ring.cap, (unsigned long long)p->ring.dropped);
+        }
+    }
     bridge_sd_log_rx(data, len);
     log_rx_locked(p, base, data, len);
     xSemaphoreGive(p->lock);

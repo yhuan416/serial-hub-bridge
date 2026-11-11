@@ -13,6 +13,7 @@
 
 #include "bridge.h"
 #include "bridge_display.h"
+#include "bridge_event.h"
 #include "bridge_net.h"
 #include "bridge_port.h"
 #include "bridge_proto.h"
@@ -24,6 +25,9 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "serial-hub-bridge %s (proto %s)", BRIDGE_FW_VERSION, BRIDGE_PROTO_VERSION);
     bridge_proto_reset();
+    if (bridge_event_init() != ESP_OK) {
+        ESP_LOGW(TAG, "event log init failed");
+    }
 
     bridge_port_config_t pc = {
         .uart_num = (uart_port_t)CONFIG_BRIDGE_UART_NUM,

@@ -130,6 +130,10 @@ READ(from_offset = barrier)
   `LOG_EXPORT` 按 `dir/seq_from/cursor/max_bytes` 分页返回 raw + index。
 - `cursor` 是**索引记录序号**；首屏按 `seq_from` 二分定位，之后 64 条/块读；
   页 32 KiB/512 行，避免每次从头逐条扫描。
+- 运行期每 10 s 尝试重挂载；`fwrite` 失败标记 broken，卸载后自动重挂；这段时间
+  继续写 4 MiB PSRAM ring，并记录 `sd.write`/`sd.remount` 事件。
+- 控制面事件独立于数据日志：`EVENT_QUERY` 返回 `{seq, ts, level, code, msg}`，
+  RAM 64 条，同时打印到串口；SD/ring 问题不写入 SD 本身。
 - 无卡 → `log_storage:"ram"`、`log_export:false`，行为回退到 RAM 窗口。
 
 实测（921600 摄像头、90 s 不读 TCP）：SD raw +472,149 B / +6,296 行，同时 RAM ring
@@ -156,8 +160,8 @@ READ(from_offset = barrier)
 - `max_frame` 默认 32 KiB：响应要走 base64（×4/3）+ cJSON 字符串，64 KiB 帧在无 PSRAM
   的板子上峰值偏高。
 - `READ` 的 `max_bytes` 被 `max_frame` 夹住；`scratch` 在启动时一次性分配。
-- 115200 无压力；921600 建议 ring ≥ 256 KiB；1.5 M 满速约 150 KB/s，256 KiB ring 只覆盖
-  ~1.7 s，必须 SD/持续 drain（或 PSRAM ring ≥ 1 MiB）。
+- 115200 无压力；921600 建议 ring ≥ 256 KiB；1.5 M 满速约 150 KB/s，4 MiB PSRAM ring
+  覆盖 ~27 s，长期仍必须 SD/持续 drain。
 
 ## 11. 测试策略
 
@@ -174,7 +178,8 @@ READ(from_offset = barrier)
    旧摄像头在 1500000/2000000 为乱码。新卡片机 WiFi 侧为 1,500,000：10 s 14.2 KiB / 228 行、
    97.5% 可打印（XMWEI/WDG_HAL/KEEPALIVE），板级默认已改 1500000。
    SD：32 GB 卡 FAT 挂载成功；90 s 空闲窗口 SD 增长 472 KB / 6,296 行，期间 ring
-   已满并累计丢弃 1.3 MB；`LOG_EXPORT` 回读的 frame no 连续。
+   已满并累计丢弃 1.3 MB；`LOG_EXPORT` 回读的 frame no 连续。新卡片机 1.5M 下
+   `EVENT_QUERY` 返回 `sd.mount`；ring 默认已升到 4 MiB。
 4. **裸协议冒烟**（脚本已验证）：`tools/smoke.mjs`（纯 Node）对真实设备跑
    `HELLO/CONFIG/WRITE/READ/TRANSACT/LOG_STATS/CLOSE`；已用主机 fake bridge 跑通全流程。
 5. **主机 E2E**：`serial-hub-mcp` 的 `test/remote_tcp.unit.js` 用 fake bridge 验证同一

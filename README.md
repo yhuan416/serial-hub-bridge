@@ -33,10 +33,11 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 | `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor` |
 | `LOG_CLEAR` | ✅ | 清 RAM 日志（`log_seq` 不回退） |
 | `LOG_EXPORT` | ✅（需 SD） | SD `raw+index` 分块导出；无卡返回 `unsupported` |
+| `EVENT_QUERY` | ✅ | 控制面事件：SD 挂载/重挂载/写失败、ring drop |
 | `INFO` / `LIST_PORTS` / `CLOSE` | ✅ | |
 
 `caps`（HELLO 返回）：`auth` 按 token、`has_sd` 按卡、`log_storage` 为
-`"raw+index"`/`"ram"`、`log_export` 按卡、`can_set_lines` 按接线、`can_break:true`、
+`"raw+index"`/`"ram"`、`log_export` 按卡、`events:true`、`can_set_lines` 按接线、`can_break:true`、
 `can_config:true`、`binary_frames:false`。
 
 ## 数据面语义（与主机一致）
@@ -135,8 +136,12 @@ SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目�
   `tools/log_export.mjs` 还原文本
 - 卡不是 FAT（exFAT/空卡）时默认挂载失败回退 RAM；`BRIDGE_SD_FORMAT_IF_FAILED=y`
   会**清空并格式化**卡
+- 运行期每 10 s 尝试重挂载；`fwrite` 失败会把 SD 标记 broken、卸载后自动重挂，
+  这段时间继续写 RAM ring，并发 `sd.write`/`sd.remount` 事件
+- 默认 ring **4 MiB（PSRAM）**：1.5M 满速约 27 s，卡片机 ~1.4 KB/s 约 48 分钟
+- 控制面事件走独立 `EVENT_QUERY`（RAM 64 条，同时串口打印），不占数据日志
 
-实测（921600 摄像头日志、90 s 不读 TCP）：
+实测（921600 摄像头日志、90 s 不读 TCP；当时 ring 还是 256 KB）：
 
 ```
 SD  raw 519,600 -> 991,749   (+472,149 B / +6,296 行)
@@ -190,7 +195,7 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --toke
 | `BRIDGE_UART_TX_GPIO` / `RX_GPIO` | 17 / 18 | |
 | `BRIDGE_UART_RTS_GPIO` / `CTS_GPIO` / `DTR_GPIO` | -1 | -1 = 未接线 |
 | `BRIDGE_UART_BAUD` | 1500000（当前卡片机；旧摄像头 921600；Kconfig 兜底 115200） | CONFIG 可运行时改 |
-| `BRIDGE_RING_BYTES` | 262144 | ≥1 MiB 建议开 PSRAM |
+| `BRIDGE_RING_BYTES` | 4194304 | 4 MiB PSRAM ring；1.5M 满速约 27 s |
 | `BRIDGE_MAX_FRAME` | 32768 | 同时限制 `READ.max_bytes` |
 | `BRIDGE_MAX_HOLD_MS` | 10000 | 超过被 clamp 并回 `hold_clamped` |
 | `BRIDGE_LOG_ENTRIES` | 256 | 0 = 关闭 RAM 行日志 |
@@ -200,15 +205,16 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --toke
 | `BRIDGE_SD_FORMAT_IF_FAILED` | n | 挂载失败自动格式化（**清空卡**） |
 | `BRIDGE_SD_RETAIN_MB` | 4096 | 日志目录保留上限 |
 | `BRIDGE_SD_SYNC_MS` | 1000 | `fsync` 周期 |
+| `BRIDGE_EVENT_ENTRIES` | 64 | 控制面事件环形队列 |
 | `BRIDGE_PROV_POP` | `abcd1234` | BLE Security1 PoP，二维码里带 |
 | `BRIDGE_PROV_BLE_PREFIX` | `PROV_` | 最终 BLE 名 `<prefix>XXXXXX` |
 | `BRIDGE_LCD_ENABLE` | y | 160×80 ST7789 显示二维码/状态 |
 | `BRIDGE_BUTTON_ENABLE` | y | GPIO0 长按恢复出厂配网 |
 | `BRIDGE_BUTTON_LONG_PRESS_MS` | 5000 | 长按阈值 |
 
-内存粗略：ring（默认 256 KiB）+ 行日志（256 × (192+40) ≈ 58 KiB）+ 部分行 1 KiB
+内存粗略：ring（默认 4 MiB，PSRAM）+ 行日志（256 × (192+40) ≈ 58 KiB）+ 部分行 1 KiB
 + 响应 scratch 32 KiB + 运行时 base64/JSON 峰值。无 PSRAM 的 S3 建议把
-`BRIDGE_RING_BYTES` 降到 128 KiB、`BRIDGE_MAX_FRAME` 降到 16 KiB。
+`BRIDGE_RING_BYTES` 降到 128 KiB、`BRIDGE_MAX_FRAME` 降到 16 KiB；无 PSRAM 时 4 MiB 会自动回退内部 RAM 并可能失败。
 
 ## 主机侧纯逻辑测试
 
@@ -268,6 +274,8 @@ TX 的 `LOG_EXPORT` 精确回读；90 s 空闲窗口 SD 增长 472 KB / 6,296 �
 10. **LCD/SD 引脚**：固定为验证板（SPI2 + LCD CS39/SD CS2）；换板需改
     `spilcd.h` 与 `BRIDGE_SD_CS_GPIO`。
 11. **LOG_QUERY vs SD**：`LOG_QUERY` 仍只查 RAM 窗口；历史统一走 `LOG_EXPORT`。
+12. **事件日志**：`EVENT_QUERY` 是 RAM 环形（默认 64 条），重启丢失；SD 写失败/重挂载
+    期间的数据仍只在 4 MiB ring + host 缓存里。
 
 ## 与 `feat/esp_idf` 的关系
 

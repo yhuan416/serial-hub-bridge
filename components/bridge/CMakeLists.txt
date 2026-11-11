@@ -33,5 +33,6 @@ idf_component_register(
         "bridge_prov.c"
         "bridge_button.c"
         "bridge_sd.c"
+        "bridge_event.c"
     INCLUDE_DIRS "include"
     REQUIRES ${bridge_requires})

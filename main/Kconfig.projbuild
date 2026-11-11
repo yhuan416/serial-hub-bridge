@@ -60,6 +60,19 @@ menu "serial-hub-bridge"
 
     endmenu
 
+    menu "Control-plane event log"
+
+        config BRIDGE_EVENT_ENTRIES
+            int "Retained events"
+            range 8 256
+            default 64
+            help
+                Bounded RAM ring for control-plane events (SD mount/format/
+                remount, write/fsync errors, ring drops). Exposed by EVENT_QUERY
+                and also printed on the serial console.
+
+    endmenu
+
     menu "SD log (raw + index)"
 
         config BRIDGE_SD_ENABLE
