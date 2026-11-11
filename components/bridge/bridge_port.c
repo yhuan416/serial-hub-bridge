@@ -718,7 +718,7 @@ bool bridge_port_log_get(bridge_port_t *p,
     return ok;
 }
 
-void bridge_port_log_clear(bridge_port_t *p)
+void bridge_port_log_clear(bridge_port_t *p, bool reset_seq)
 {
     if (!p) {
         return;
@@ -726,5 +726,20 @@ void bridge_port_log_clear(bridge_port_t *p)
     xSemaphoreTake(p->lock, portMAX_DELAY);
     p->log_count = 0;
     p->log_head = 0;
+    if (reset_seq) {
+        p->log_seq = 0;
+    }
+    xSemaphoreGive(p->lock);
+}
+
+void bridge_port_log_set_seq(bridge_port_t *p, uint32_t seq)
+{
+    if (!p) {
+        return;
+    }
+    xSemaphoreTake(p->lock, portMAX_DELAY);
+    if (seq > p->log_seq) {
+        p->log_seq = seq;
+    }
     xSemaphoreGive(p->lock);
 }

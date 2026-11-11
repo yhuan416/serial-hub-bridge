@@ -16,7 +16,7 @@
 **非目标（v0）**
 
 - 设备主动推流、压缩、二进制帧、TLS、多 host 共享。
-- 跨重启 SD segment 列表/导出（当前只导出本次启动的 segment）。
+- 跨重启 SD segment 列表/导出：启动扫描并续写最新完整段，`LOG_STATS.segments[]` + `LOG_EXPORT.segment`。
 - 多端口（固定 `uart0`，但协议字段已处理：其它 `port` 返回 `port_not_found`）。
 
 ## 2. 代码分层
@@ -137,13 +137,15 @@ READ(from_offset = barrier)
 - 无卡 → `log_storage:"ram"`、`log_export:false`，行为回退到 RAM 窗口。
 
 实测（921600 摄像头、90 s 不读 TCP）：SD raw +472,149 B / +6,296 行，同时 RAM ring
-已满并累计丢弃 1.3 MB；导出的 frame no 连续。当前限制：只导出本次启动 segment、
+已满并累计丢弃 1.3 MB；导出的 frame no 连续。当前实现会扫描并续写最新完整 segment，
+`LOG_STATS.segments[]` 暴露所有段，`LOG_EXPORT.segment` 可按段导出；seq 为段内序号。
 导出速度受 WiFi/视频上传影响、时间仍是 uptime。
 
 ## 8. 鉴权与并发
 
 - `HELLO` 必须是首帧；token 用长度/字节比较（常量时间风格）。
-- 失败回 `unauthorized` 并关闭；未 HELLO 的其它 op 同样关闭。
+- 失败回 `unauthorized` 并关闭；未 HELLO 的其它 op 同样关闭。首次启动自动生成
+  NVS token（`CONFIG_BRIDGE_AUTH_TOKEN` 可覆盖），并打印/随配网 QR 提供。
 - 一个连接串行处理请求；不实现 `busy`（v0 host 本来就不 pipeline）。
 - 断线即丢会话，重连重新 `HELLO`；游标在 host 侧的 `next_offset`，设备无状态。
 
@@ -211,9 +213,9 @@ GOT_IP）、LCD 二维码/状态、以及断线重连（1 s 定时器）。配�
 
 | 项 | 现状 | 计划 |
 |---|---|---|
-| `LOG_EXPORT` | ✅ SD `raw+index`（本次启动 segment） | 跨重启 segment 列表 |
+| `LOG_EXPORT` | ✅ SD `raw+index`（活动段/指定 segment） | 跨段全局 seq（当前段内 seq） |
 | `caps.log_storage` | `"raw+index"`（有卡）/ `"ram"` | — |
-| SD 保留 | 4 GB / 目录总量 | 按天/容量轮转与导出 |
+| SD 保留 | 目录总量 `BRIDGE_SD_RETAIN_MB` | 按 `BRIDGE_SD_SEGMENT_MAX_MB` 轮转 |
 | `time` | uptime tick，`synced:false` | SNTP 后给 epoch |
 | 多端口 | 仅 `uart0` | 端口表 + Kconfig |
 | `busy` | 不返回（串行处理） | 若未来 pipeline 再加 |

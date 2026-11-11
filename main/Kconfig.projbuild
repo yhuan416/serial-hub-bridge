@@ -121,6 +121,15 @@ menu "serial-hub-bridge"
             range 100 60000
             depends on BRIDGE_SD_ENABLE
 
+        config BRIDGE_SD_SEGMENT_MAX_MB
+            int "Rotate to a new segment at this size (MB)"
+            default 3072
+            range 64 4000
+            depends on BRIDGE_SD_ENABLE
+            help
+                FAT32 has a 4 GiB per-file limit. Rotate before that; old
+                segments remain visible in LOG_STATS and exportable by id.
+
     endmenu
 
     menu "UART"

@@ -116,7 +116,8 @@ bool bridge_port_log_get(bridge_port_t *p,
                          char *text,
                          size_t text_cap);
 
-void bridge_port_log_clear(bridge_port_t *p);
+void bridge_port_log_clear(bridge_port_t *p, bool reset_seq);
+void bridge_port_log_set_seq(bridge_port_t *p, uint32_t seq);
 
 #ifdef __cplusplus
 }

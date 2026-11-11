@@ -742,6 +742,11 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
     bridge_sd_get_status(&sd);
     const bool use_sd = sd.mounted;
 
+    uint32_t ram_first = 0;
+    bool has_ram_first = bridge_port_log_earliest_seq(ctx->port, &ram_first);
+    uint32_t ram_latest = bridge_port_log_latest_seq(ctx->port);
+    uint32_t ram_count = bridge_port_log_count(ctx->port);
+
     uint32_t seq = 0;
     bool has_earliest = false;
     uint32_t latest_seq = 0;
@@ -754,8 +759,9 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
         capacity = sd.capacity_bytes;
         used = sd.used_bytes;
     } else {
-        has_earliest = bridge_port_log_earliest_seq(ctx->port, &seq);
-        latest_seq = bridge_port_log_latest_seq(ctx->port);
+        has_earliest = has_ram_first;
+        seq = ram_first;
+        latest_seq = ram_latest;
         capacity = bridge_port_log_capacity_bytes(ctx->port);
         used = bridge_port_log_used_bytes(ctx->port);
     }
@@ -769,14 +775,44 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
         cJSON_AddNullToObject(r, "earliest_seq");
     }
     cJSON_AddNumberToObject(r, "latest_seq", (double)latest_seq);
-    cJSON_AddStringToObject(r, "source", "device");
-    cJSON_AddBoolToObject(r, "authoritative", true);
-    cJSON_AddStringToObject(r, "storage", use_sd ? "raw+index" : "ram");
+    if (has_ram_first) {
+        cJSON_AddNumberToObject(r, "ram_earliest_seq", (double)ram_first);
+    } else {
+        cJSON_AddNullToObject(r, "ram_earliest_seq");
+    }
+    cJSON_AddNumberToObject(r, "ram_latest_seq", (double)ram_latest);
+    cJSON_AddNumberToObject(r, "ram_count", (double)ram_count);
     if (use_sd) {
+        if (sd.earliest_seq) {
+            cJSON_AddNumberToObject(r, "sd_earliest_seq", (double)sd.earliest_seq);
+        } else {
+            cJSON_AddNullToObject(r, "sd_earliest_seq");
+        }
+        cJSON_AddNumberToObject(r, "sd_latest_seq", (double)sd.latest_seq);
+        cJSON_AddNumberToObject(r, "global_latest_seq", (double)sd.global_latest_seq);
         cJSON_AddStringToObject(r, "segment", sd.segment);
         cJSON_AddNumberToObject(r, "raw_bytes", (double)sd.raw_bytes);
         cJSON_AddNumberToObject(r, "index_count", (double)sd.index_count);
+        cJSON *segs = cJSON_AddArrayToObject(r, "segments");
+        for (size_t i = 0; i < sd.segment_count; i++) {
+            const bridge_sd_segment_t *sg = &sd.segments[i];
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "id", sg->id);
+            cJSON_AddNumberToObject(o, "raw_bytes", (double)sg->raw_bytes);
+            cJSON_AddNumberToObject(o, "index_count", (double)sg->index_count);
+            cJSON_AddNumberToObject(o, "first_seq", (double)sg->first_seq);
+            cJSON_AddNumberToObject(o, "latest_seq", (double)sg->latest_seq);
+            cJSON_AddNumberToObject(o, "mtime_s", (double)sg->mtime_s);
+            cJSON_AddBoolToObject(o, "active", sg->active);
+            cJSON_AddItemToArray(segs, o);
+        }
+    } else {
+        cJSON_AddNullToObject(r, "sd_earliest_seq");
+        cJSON_AddNullToObject(r, "sd_latest_seq");
     }
+    cJSON_AddStringToObject(r, "source", "device");
+    cJSON_AddBoolToObject(r, "authoritative", true);
+    cJSON_AddStringToObject(r, "storage", use_sd ? "raw+index" : "ram");
     cJSON_AddNumberToObject(r, "sd_write_errors", (double)sd.write_errors);
     cJSON_AddBoolToObject(r, "sd_broken", sd.broken);
 
@@ -912,6 +948,25 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     cJSON_AddItemToObject(r, "entries", entries);
     cJSON_AddNumberToObject(r, "count", count);
     cJSON_AddBoolToObject(r, "truncated", truncated);
+    cJSON_AddNumberToObject(r, "ram_latest_seq", (double)bridge_port_log_latest_seq(ctx->port));
+    cJSON_AddNumberToObject(r, "ram_count", (double)bridge_port_log_count(ctx->port));
+    if (has_earliest) {
+        cJSON_AddNumberToObject(r, "ram_earliest_seq", (double)earliest);
+    } else {
+        cJSON_AddNullToObject(r, "ram_earliest_seq");
+    }
+    bridge_sd_status_t sd;
+    bridge_sd_get_status(&sd);
+    if (sd.mounted && sd.earliest_seq) {
+        cJSON_AddNumberToObject(r, "sd_earliest_seq", (double)sd.earliest_seq);
+    } else {
+        cJSON_AddNullToObject(r, "sd_earliest_seq");
+    }
+    if (sd.mounted) {
+        cJSON_AddNumberToObject(r, "sd_latest_seq", (double)sd.latest_seq);
+    } else {
+        cJSON_AddNullToObject(r, "sd_latest_seq");
+    }
     if (have_last) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%u", (unsigned)last_seq);
@@ -1039,6 +1094,10 @@ static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
     if (ju32(msg, "max_bytes", &v)) {
         req.max_bytes = v;
     }
+    const char *segment = jstr(msg, "segment");
+    if (segment && segment[0]) {
+        req.segment = segment;
+    }
     const char *cursor = jstr(msg, "cursor");
     if (cursor && cursor[0]) {
         req.cursor = strtoull(cursor, NULL, 10);
@@ -1075,6 +1134,9 @@ static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
         cJSON_AddStringToObject(r, "next_cursor", cur);
     }
     cJSON_AddBoolToObject(r, "eof", ex.eof);
+    if (ex.segment[0]) {
+        cJSON_AddStringToObject(r, "segment", ex.segment);
+    }
     cJSON_AddStringToObject(r, "source", "device");
     cJSON_AddBoolToObject(r, "authoritative", true);
     cJSON_AddStringToObject(r, "time_source", "tick");
@@ -1088,12 +1150,35 @@ static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
 static char *handle_log_clear(bridge_ctx_t *ctx, const cJSON *msg)
 {
     const cJSON *id = jid(msg);
-    bridge_port_log_clear(ctx->port);
+    const char *segment = jstr(msg, "segment");
+    if (segment && segment[0] &&
+        (strcmp(segment, "all") == 0 || strcmp(segment, "*") == 0)) {
+        segment = NULL;
+    }
+    bool active_cleared = false;
+    bool sd_cleared = false;
     if (bridge_sd_ready()) {
-        bridge_sd_clear();
+        esp_err_t err = bridge_sd_clear(segment, &active_cleared);
+        if (err != ESP_OK) {
+            return make_err(id, err == ESP_ERR_INVALID_ARG ? "bad_request" : "io_error",
+                            esp_err_to_name(err));
+        }
+        sd_cleared = true;
+    } else if (segment && segment[0]) {
+        return make_err(id, "unsupported", "no SD card; cannot clear a segment");
+    }
+    const bool clear_ram = !segment || !segment[0] || active_cleared;
+    if (clear_ram) {
+        bridge_port_log_clear(ctx->port, !segment || !segment[0]);
     }
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "cleared", true);
+    cJSON_AddBoolToObject(r, "sd_cleared", sd_cleared);
+    cJSON_AddBoolToObject(r, "ram_cleared", clear_ram);
+    cJSON_AddBoolToObject(r, "active_cleared", active_cleared);
+    if (segment && segment[0]) {
+        cJSON_AddStringToObject(r, "segment", segment);
+    }
     return make_ok(id, r);
 }
 

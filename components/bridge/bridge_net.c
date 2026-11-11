@@ -14,6 +14,7 @@
 #include "bridge_button.h"
 #include "bridge_proto.h"
 #include "bridge_prov.h"
+#include "bridge_auth.h"
 
 #define TAG "bridge_net"
 
@@ -172,6 +173,9 @@ void bridge_net_run(bridge_ctx_t *ctx, const bridge_net_config_t *cfg)
         ESP_LOGE(TAG, "provisioning init failed: %s", esp_err_to_name(err));
         return;
     }
+
+    ctx->token = bridge_auth_token();
+    ESP_LOGI(TAG, "auth=%s", ctx->token ? "on" : "off");
 
     bridge_button_init();
     serve_forever(ctx, cfg->tcp_port);

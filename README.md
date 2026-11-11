@@ -29,16 +29,30 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 | `SET_LINES` | ✅（按接线） | RTS 走 UART，DTR 走普通 GPIO；未接线返回 `unsupported` |
 | `BREAK` | ✅（需实机确认） | `uart_write_bytes_with_break(size=0)` |
 | `PING` | ✅ | `t_ms` 回显 + `device_tick_ms` |
-| `LOG_STATS` | ✅ | ring 水位 + SD/RAM 日志统计 |
-| `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor` |
-| `LOG_CLEAR` | ✅ | 清 RAM 日志（`log_seq` 不回退） |
-| `LOG_EXPORT` | ✅（需 SD） | SD `raw+index` 分块导出；无卡返回 `unsupported` |
+| `LOG_STATS` | ✅ | ring 水位 + RAM/SD 统计、`segments[]`、`ram_*`/`sd_*` seq |
+| `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor`；line/hex 受 `log_line_max` 截断 |
+| `LOG_CLEAR` | ✅ | 省略 `segment` 清所有段并重置 seq；指定段只清该段 |
+| `LOG_EXPORT` | ✅（需 SD） | 按 `segment` 导出 SD `raw+index`；省略导出活动段 |
 | `EVENT_QUERY` | ✅ | 控制面事件：SD 挂载/重挂载/写失败、ring drop |
 | `INFO` / `LIST_PORTS` / `CLOSE` | ✅ | |
 
 `caps`（HELLO 返回）：`auth` 按 token、`has_sd` 按卡、`log_storage` 为
 `"raw+index"`/`"ram"`、`log_export` 按卡、`events:true`、`can_set_lines` 按接线、`can_break:true`、
 `can_config:true`、`binary_frames:false`。
+
+### 鉴权
+
+首次启动会在 NVS 生成 16 字节随机 token（`CONFIG_BRIDGE_AUTH_TOKEN` 非空则覆盖），
+串口打印：
+
+```
+I (1575) bridge_auth: auth token from NVS: <token>
+I (2519) bridge_net: auth=on
+```
+
+主机 `open({transport:"remote", endpoint:"tcp://<ip>:7000", token:"<token>"})`。
+未配网时 QR payload 也带 `"token":"..."`。v0 仍是明文，跨不可信网络请走 VPN/SSH；
+换 token 可清 NVS/恢复出厂后重启。
 
 ## 数据面语义（与主机一致）
 
@@ -102,7 +116,7 @@ I (1235) bridge_net: listening on tcp://0.0.0.0:7000 (proto v0)
 BLE Security1 + PoP，二维码就是官方 payload：
 
 ```json
-{"ver":"v1","name":"PROV_00B160","pop":"abcd1234","transport":"ble"}
+{"ver":"v1","name":"PROV_00B160","pop":"abcd1234","transport":"ble","token":"<nvs-token>"}
 ```
 
 - BLE 名：`<BRIDGE_PROV_BLE_PREFIX><MAC 末三字节>`，默认 `PROV_00B160`
@@ -126,7 +140,11 @@ LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
 
 ## SD 权威日志
 
-SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目录 `/sdcard/shb`：
+SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目录 `/sdcard/shb`。
+每次启动/重挂载会扫描已有 segment，**续写最新完整段**并恢复 seq；达到
+`CONFIG_BRIDGE_SD_SEGMENT_MAX_MB`（默认 3072）滚动新段，避免 FAT32 4 GiB 单文件上限。
+`LOG_STATS.segments[]` 列出全部段，旧段可按 `segment` 导出/清理。
+
 
 - 每个方向独立文件：`raw-rx-<seg>.bin` / `idx-rx-<seg>.bin`，TX 同理
 - 索引 20 B/条：`offset(u64) + seq(u32) + tick(u32) + len(u16) + dir + pad`

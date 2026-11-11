@@ -53,14 +53,14 @@ void app_main(void)
         ESP_LOGW(TAG, "LCD init failed; QR only in the serial log");
     }
 #endif
-    if (bridge_sd_init(bridge_display_ready()) != ESP_OK) {
-        ESP_LOGW(TAG, "SD log unavailable; RAM-only mode");
-    }
-
     bridge_port_t *port = bridge_port_init(&pc);
     if (!port) {
         ESP_LOGE(TAG, "failed to init UART bridge port");
         return;
+    }
+
+    if (bridge_sd_init(bridge_display_ready(), port) != ESP_OK) {
+        ESP_LOGW(TAG, "SD log unavailable; RAM-only mode");
     }
 
     static bridge_ctx_t ctx;

@@ -17,6 +17,7 @@
 #include "sdkconfig.h"
 
 #include "bridge_display.h"
+#include "bridge_auth.h"
 
 #define TAG "bridge_prov"
 
@@ -94,9 +95,16 @@ static void build_qr(void)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_ble_name, sizeof(s_ble_name), "%s%02X%02X%02X",
              CONFIG_BRIDGE_PROV_BLE_PREFIX, mac[3], mac[4], mac[5]);
-    snprintf(s_qr_payload, sizeof(s_qr_payload),
-             "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"ble\"}",
-             s_ble_name, CONFIG_BRIDGE_PROV_POP);
+    const char *tok = bridge_auth_token();
+    if (tok && tok[0]) {
+        snprintf(s_qr_payload, sizeof(s_qr_payload),
+                 "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"ble\",\"token\":\"%s\"}",
+                 s_ble_name, CONFIG_BRIDGE_PROV_POP, tok);
+    } else {
+        snprintf(s_qr_payload, sizeof(s_qr_payload),
+                 "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"ble\"}",
+                 s_ble_name, CONFIG_BRIDGE_PROV_POP);
+    }
 
     ESP_LOGI(TAG, "BLE name=%s", s_ble_name);
     ESP_LOGI(TAG, "QR payload: %s", s_qr_payload);
@@ -229,6 +237,9 @@ esp_err_t bridge_prov_init(void)
     }
     if (err != ESP_OK) {
         return err;
+    }
+    if (bridge_auth_init() != ESP_OK) {
+        ESP_LOGW(TAG, "auth init failed; HELLO token disabled");
     }
 
     s_lock = xSemaphoreCreateMutex();

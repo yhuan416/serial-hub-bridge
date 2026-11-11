@@ -20,6 +20,20 @@
 extern "C" {
 #endif
 
+typedef struct bridge_port bridge_port_t;
+
+#define BRIDGE_SD_MAX_SEGMENTS 16
+
+typedef struct {
+    char id[40];
+    uint64_t raw_bytes;
+    uint32_t index_count;
+    uint32_t first_seq;
+    uint32_t latest_seq;
+    int64_t mtime_s;
+    bool active;
+} bridge_sd_segment_t;
+
 /* Packed 20-byte index record. `offset` is the per-boot RX/TX absolute offset
  * of the line start; `len` is the raw span (including CR/LF) or the TX length. */
 typedef struct __attribute__((packed)) {
@@ -40,12 +54,16 @@ typedef struct {
     uint32_t index_count; /* current segment */
     uint32_t write_errors;
     bool broken;
-    uint32_t earliest_seq;
-    uint32_t latest_seq;
+    uint32_t earliest_seq;      /* current segment */
+    uint32_t latest_seq;        /* current segment */
+    uint32_t global_latest_seq; /* max latest_seq across segments */
     char segment[40];
+    size_t segment_count;
+    bridge_sd_segment_t segments[BRIDGE_SD_MAX_SEGMENTS];
 } bridge_sd_status_t;
 
 typedef struct {
+    const char *segment; /* NULL/empty = active segment */
     uint8_t dir; /* 0=rx, 1=tx; 0xff=any (not supported for export) */
     bool has_seq_from;
     uint32_t seq_from;
@@ -60,12 +78,14 @@ typedef struct {
     size_t chunk_len;
     uint8_t *index; /* sd_idx_rec_t[] with offset relative to chunk start */
     size_t index_len;
+    char segment[40];
     bool eof;
     uint64_t next_cursor;
 } bridge_sd_export_t;
 
-esp_err_t bridge_sd_init(bool spi_bus_ready);
+esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t *port);
 bool bridge_sd_ready(void);
+uint32_t bridge_sd_latest_seq(void);
 void bridge_sd_sync(void);
 
 /* Raw append (called from the UART RX/TX path). */
@@ -81,7 +101,8 @@ void bridge_sd_get_status(bridge_sd_status_t *out);
 /* Export one page. Caller frees `out` with bridge_sd_export_free(). */
 esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t *out);
 void bridge_sd_export_free(bridge_sd_export_t *out);
-esp_err_t bridge_sd_clear(void);
+/* segment=NULL/empty clears all segments; returns whether the active segment was cleared. */
+esp_err_t bridge_sd_clear(const char *segment, bool *active_cleared);
 
 #ifdef __cplusplus
 }
