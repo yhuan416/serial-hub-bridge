@@ -802,6 +802,11 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
             cJSON_AddNumberToObject(o, "index_count", (double)sg->index_count);
             cJSON_AddNumberToObject(o, "first_seq", (double)sg->first_seq);
             cJSON_AddNumberToObject(o, "latest_seq", (double)sg->latest_seq);
+            cJSON_AddNumberToObject(o, "latest_rx", (double)sg->latest_rx);
+            cJSON_AddNumberToObject(o, "latest_tx", (double)sg->latest_tx);
+            cJSON_AddNumberToObject(o, "acked_rx", (double)sg->acked_rx);
+            cJSON_AddNumberToObject(o, "acked_tx", (double)sg->acked_tx);
+            cJSON_AddBoolToObject(o, "acked", sg->acked);
             cJSON_AddNumberToObject(o, "mtime_s", (double)sg->mtime_s);
             cJSON_AddBoolToObject(o, "active", sg->active);
             cJSON_AddItemToArray(segs, o);
@@ -1158,6 +1163,38 @@ static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
     return make_ok(id, r);
 }
 
+static char *handle_log_ack(bridge_ctx_t *ctx, const cJSON *msg)
+{
+    (void)ctx;
+    const cJSON *id = jid(msg);
+    const char *segment = jstr(msg, "segment");
+    const char *dir = jstr(msg, "dir");
+    uint32_t seq = 0;
+    if (!segment || !segment[0]) {
+        return make_err(id, "bad_request", "segment required");
+    }
+    if (!dir || (strcmp(dir, "rx") != 0 && strcmp(dir, "tx") != 0)) {
+        return make_err(id, "bad_request", "dir must be rx|tx");
+    }
+    if (!ju32(msg, "seq", &seq)) {
+        return make_err(id, "bad_request", "seq required");
+    }
+    if (!bridge_sd_ready()) {
+        return make_err(id, "unsupported", "no SD card");
+    }
+    esp_err_t err = bridge_sd_ack(segment, strcmp(dir, "tx") == 0 ? 1 : 0, seq);
+    if (err != ESP_OK) {
+        return make_err(id, err == ESP_ERR_INVALID_ARG ? "bad_request" : "io_error",
+                        esp_err_to_name(err));
+    }
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "acked", true);
+    cJSON_AddStringToObject(r, "segment", segment);
+    cJSON_AddStringToObject(r, "dir", dir);
+    cJSON_AddNumberToObject(r, "seq", (double)seq);
+    return make_ok(id, r);
+}
+
 static char *handle_log_clear(bridge_ctx_t *ctx, const cJSON *msg)
 {
     const cJSON *id = jid(msg);
@@ -1311,6 +1348,8 @@ char *bridge_proto_handle(bridge_ctx_t *ctx,
         out = handle_log_query(ctx, msg);
     } else if (strcmp(op, "LOG_CLEAR") == 0) {
         out = handle_log_clear(ctx, msg);
+    } else if (strcmp(op, "LOG_ACK") == 0) {
+        out = handle_log_ack(ctx, msg);
     } else if (strcmp(op, "LOG_EXPORT") == 0) {
         out = handle_log_export(ctx, msg);
     } else if (strcmp(op, "CLOSE") == 0) {

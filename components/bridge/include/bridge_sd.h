@@ -30,8 +30,13 @@ typedef struct {
     uint32_t index_count;
     uint32_t first_seq;
     uint32_t latest_seq;
+    uint32_t latest_rx;
+    uint32_t latest_tx;
+    uint32_t acked_rx;
+    uint32_t acked_tx;
     int64_t mtime_s;
     bool active;
+    bool acked;
 } bridge_sd_segment_t;
 
 /* Packed 20-byte index record. `offset` is the per-boot RX/TX absolute offset
@@ -106,6 +111,9 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
 void bridge_sd_export_free(bridge_sd_export_t *out);
 /* segment=NULL/empty clears all segments; returns whether the active segment was cleared. */
 esp_err_t bridge_sd_clear(const char *segment, bool *active_cleared);
+
+/* Persist host archive watermarks for retention; dir 0=rx, 1=tx. */
+esp_err_t bridge_sd_ack(const char *segment, uint8_t dir, uint32_t seq);
 
 #ifdef __cplusplus
 }

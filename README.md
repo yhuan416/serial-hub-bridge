@@ -33,6 +33,7 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 | `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor`；line/hex 受 `log_line_max` 截断 |
 | `LOG_CLEAR` | ✅ | 省略 `segment` 清所有段并重置 seq；指定段只清该段 |
 | `LOG_EXPORT` | ✅（需 SD） | 按 `segment` 导出 SD `raw+index`；省略导出活动段 |
+| `LOG_ACK` | ✅ | host 归档水位；retention 只删已确认归档的完整段 |
 | `EVENT_QUERY` | ✅ | 控制面事件：SD 挂载/重挂载/写失败、ring drop |
 | `INFO` / `LIST_PORTS` / `CLOSE` | ✅ | |
 
@@ -146,6 +147,9 @@ LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
 ## SD 权威日志
 
 SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目录 `/sdcard/shb`。
+host `log_sync` 完整导出后会发 `LOG_ACK`，retention 只删除 `acked_rx/tx` 覆盖 latest 的
+segment；只有卡剩余空间低于 `BRIDGE_SD_UNACKED_FREE_MB` 时才强制删除最旧未归档段并记
+`sd.retention_unacked`。resume 会修复 index 尾和 orphan raw（`sd.repair`）。
 `LOG_STATS.sd_queue` 显示 UART→SD 队列水位；`uart_overflow_bytes`/`ring.dropped_bytes`
 是 UART/ring 侧丢失计数。默认 UART 驱动缓冲 32 KiB、SD queue 3 MiB（可 menuconfig 调整）。
 每次启动/重挂载会扫描已有 segment，**续写最新完整段**并恢复 seq；达到
@@ -232,6 +236,7 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --toke
 | `BRIDGE_SD_FORMAT_IF_FAILED` | n | 挂载失败自动格式化（**清空卡**） |
 | `BRIDGE_SD_RETAIN_MB` | 4096 | 日志目录保留上限 |
 | `BRIDGE_SD_SYNC_MS` | 1000 | `fsync` 周期 |
+| `BRIDGE_SD_UNACKED_FREE_MB` | 256 | 卡将满时强制删最旧未归档段 |
 | `BRIDGE_EVENT_ENTRIES` | 64 | 控制面事件环形队列 |
 | `BRIDGE_PROV_POP` | `abcd1234` | BLE Security1 PoP，二维码里带 |
 | `BRIDGE_PROV_BLE_PREFIX` | `PROV_` | 最终 BLE 名 `<prefix>XXXXXX` |
