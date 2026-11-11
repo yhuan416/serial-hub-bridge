@@ -2,6 +2,7 @@
 #include "bridge.h"
 #include "bridge_event.h"
 #include "bridge_sd.h"
+#include "bridge_time.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -139,7 +140,9 @@ static uint32_t log_push_locked(bridge_port_t *p, uint8_t dir, uint64_t offset, 
 
     bridge_log_meta_t *m = &p->log_meta[slot];
     m->seq = seq;
-    m->ts_ms = (int64_t)bridge_now_ms();
+    m->ts_synced = bridge_time_synced();
+    m->ts_ms = m->ts_synced ? (int64_t)bridge_time_epoch_ms()
+                            : (int64_t)bridge_now_ms();
     m->dir = dir;
     m->offset = offset;
     m->bytes = len;

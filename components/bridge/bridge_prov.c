@@ -17,6 +17,7 @@
 #include "sdkconfig.h"
 
 #include "bridge_display.h"
+#include "bridge_time.h"
 #include "bridge_auth.h"
 
 #define TAG "bridge_prov"
@@ -218,6 +219,7 @@ static void on_prov_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (s_reconnect_timer) {
             xTimerStop(s_reconnect_timer, 0);
         }
+        bridge_time_start();
         bridge_display_hide_qr();
         refresh_display();
         ESP_LOGI(TAG, "connected to \"%s\", ip " IPSTR, s_ssid, IP2STR(&ev->ip_info.ip));

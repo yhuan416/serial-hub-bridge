@@ -34,9 +34,11 @@ typedef struct {
     uint32_t latest_tx;
     uint32_t acked_rx;
     uint32_t acked_tx;
+    int64_t epoch_base_ms;
     int64_t mtime_s;
     bool active;
     bool acked;
+    bool time_synced;
 } bridge_sd_segment_t;
 
 /* Packed 20-byte index record. `offset` is the per-boot RX/TX absolute offset
@@ -62,6 +64,8 @@ typedef struct {
     uint32_t earliest_seq;      /* current segment */
     uint32_t latest_seq;        /* current segment */
     uint32_t global_latest_seq; /* max latest_seq across segments */
+    int64_t epoch_base_ms;      /* active segment tick -> epoch anchor */
+    bool time_synced;
     uint64_t queue_bytes;   /* SD submit queue capacity */
     uint64_t queue_used;
     uint32_t queue_dropped;
@@ -88,6 +92,8 @@ typedef struct {
     uint8_t *index; /* sd_idx_rec_t[] with offset relative to chunk start */
     size_t index_len;
     char segment[40];
+    int64_t time_base_ms;
+    bool time_synced;
     bool eof;
     uint64_t next_cursor;
 } bridge_sd_export_t;

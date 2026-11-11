@@ -17,6 +17,18 @@ menu "serial-hub-bridge"
                 other op before HELLO is rejected with `unauthorized`.
                 v0 is plaintext: use a trusted LAN / VPN.
 
+        config BRIDGE_NTP_ENABLE
+            bool "Synchronize wall-clock time over SNTP"
+            default y
+            help
+                Starts SNTP after Wi-Fi gets an IP. Logs keep monotonic ticks
+                internally and add a per-segment time base after first sync.
+
+        config BRIDGE_NTP_SERVER
+            string "SNTP server"
+            default "ntp.aliyun.com"
+            depends on BRIDGE_NTP_ENABLE
+
         config BRIDGE_PROV_POP
             string "BLE provisioning PoP"
             default "abcd1234"

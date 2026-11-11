@@ -18,6 +18,7 @@
 #include "bridge_port.h"
 #include "bridge_proto.h"
 #include "bridge_sd.h"
+#include "bridge_time.h"
 
 static const char *TAG = "app";
 
@@ -25,6 +26,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "serial-hub-bridge %s (proto %s)", BRIDGE_FW_VERSION, BRIDGE_PROTO_VERSION);
     bridge_proto_reset();
+    bridge_time_init();
     if (bridge_event_init() != ESP_OK) {
         ESP_LOGW(TAG, "event log init failed");
     }

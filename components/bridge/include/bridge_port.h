@@ -61,6 +61,7 @@ typedef struct {
     uint32_t bytes;    /* full logical line length */
     uint32_t text_len; /* stored line length (<= log_line_max) */
     bool truncated;
+    bool ts_synced;
 } bridge_log_meta_t;
 
 bridge_port_t *bridge_port_init(const bridge_port_config_t *cfg);

@@ -11,6 +11,7 @@
 
 #include "bridge_port.h"
 #include "bridge_sd.h"
+#include "bridge_time.h"
 #include "bridge_event.h"
 
 #define TAG "bridge_proto"
@@ -371,10 +372,11 @@ static cJSON *build_info(bridge_ctx_t *ctx)
     cJSON_AddItemToArray(ports, p);
 
     cJSON *time = cJSON_AddObjectToObject(res, "time");
-    cJSON_AddNumberToObject(time, "epoch_ms", 0);
-    cJSON_AddBoolToObject(time, "synced", false);
-    cJSON_AddStringToObject(time, "source", "tick");
-    cJSON_AddNumberToObject(time, "tick_ms", (double)bridge_now_ms());
+    bool synced = bridge_time_synced();
+    cJSON_AddNumberToObject(time, "epoch_ms", (double)bridge_time_epoch_ms());
+    cJSON_AddBoolToObject(time, "synced", synced);
+    cJSON_AddStringToObject(time, "source", synced ? "ntp" : "tick");
+    cJSON_AddNumberToObject(time, "tick_ms", (double)bridge_time_tick_ms());
 
     return res;
 }
@@ -793,6 +795,8 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
         cJSON_AddStringToObject(r, "segment", sd.segment);
         cJSON_AddNumberToObject(r, "raw_bytes", (double)sd.raw_bytes);
         cJSON_AddNumberToObject(r, "index_count", (double)sd.index_count);
+        cJSON_AddNumberToObject(r, "epoch_base_ms", (double)sd.epoch_base_ms);
+        cJSON_AddBoolToObject(r, "time_synced", sd.time_synced);
         cJSON *segs = cJSON_AddArrayToObject(r, "segments");
         for (size_t i = 0; i < sd.segment_count; i++) {
             const bridge_sd_segment_t *sg = &sd.segments[i];
@@ -807,6 +811,8 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
             cJSON_AddNumberToObject(o, "acked_rx", (double)sg->acked_rx);
             cJSON_AddNumberToObject(o, "acked_tx", (double)sg->acked_tx);
             cJSON_AddBoolToObject(o, "acked", sg->acked);
+            cJSON_AddNumberToObject(o, "epoch_base_ms", (double)sg->epoch_base_ms);
+            cJSON_AddBoolToObject(o, "time_synced", sg->time_synced);
             cJSON_AddNumberToObject(o, "mtime_s", (double)sg->mtime_s);
             cJSON_AddBoolToObject(o, "active", sg->active);
             cJSON_AddItemToArray(segs, o);
@@ -840,8 +846,11 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
     cJSON_AddNumberToObject(q, "dropped_bytes", (double)sd.queue_dropped_bytes);
 
     cJSON *time = cJSON_AddObjectToObject(r, "time");
-    cJSON_AddBoolToObject(time, "synced", false);
-    cJSON_AddStringToObject(time, "source", "tick");
+    bool synced = bridge_time_synced();
+    cJSON_AddNumberToObject(time, "epoch_ms", (double)bridge_time_epoch_ms());
+    cJSON_AddBoolToObject(time, "synced", synced);
+    cJSON_AddStringToObject(time, "source", synced ? "ntp" : "tick");
+    cJSON_AddNumberToObject(time, "tick_ms", (double)bridge_time_tick_ms());
     return make_ok(id, r);
 }
 
@@ -899,6 +908,8 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     bool truncated = false;
     uint32_t last_seq = 0;
     bool have_last = false;
+    bridge_sd_status_t sd;
+    bridge_sd_get_status(&sd);
 
     uint32_t total = bridge_port_log_count(ctx->port);
     for (uint32_t i = 0; i < total; i++) {
@@ -939,6 +950,7 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
         cJSON *e = cJSON_CreateObject();
         cJSON_AddNumberToObject(e, "seq", m.seq);
         cJSON_AddNumberToObject(e, "ts", (double)m.ts_ms);
+        cJSON_AddStringToObject(e, "ts_source", m.ts_synced ? "ntp" : "tick");
         cJSON_AddStringToObject(e, "dir", m.dir ? "tx" : "rx");
         cJSON_AddNumberToObject(e, "offset", (double)m.offset);
         cJSON_AddStringToObject(e, "line", line);
@@ -971,8 +983,6 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     } else {
         cJSON_AddNullToObject(r, "ram_earliest_seq");
     }
-    bridge_sd_status_t sd;
-    bridge_sd_get_status(&sd);
     if (sd.mounted && sd.earliest_seq) {
         cJSON_AddNumberToObject(r, "sd_earliest_seq", (double)sd.earliest_seq);
     } else {
@@ -997,7 +1007,9 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     }
     cJSON_AddStringToObject(r, "source", "device");
     cJSON_AddBoolToObject(r, "authoritative", true);
-    cJSON_AddStringToObject(r, "time_source", "tick");
+    cJSON_AddBoolToObject(r, "time_synced", sd.time_synced);
+    cJSON_AddNumberToObject(r, "time_base_ms", (double)sd.epoch_base_ms);
+    cJSON_AddStringToObject(r, "time_source", sd.time_synced ? "ntp" : "tick");
     return make_ok(id, r);
 }
 
@@ -1153,6 +1165,8 @@ static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
     if (ex.segment[0]) {
         cJSON_AddStringToObject(r, "segment", ex.segment);
     }
+    cJSON_AddNumberToObject(r, "time_base_ms", (double)ex.time_base_ms);
+    cJSON_AddBoolToObject(r, "time_synced", ex.time_synced);
     cJSON_AddStringToObject(r, "source", "device");
     cJSON_AddBoolToObject(r, "authoritative", true);
     cJSON_AddStringToObject(r, "time_source", "tick");

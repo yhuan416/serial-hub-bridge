@@ -15,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include "bridge_event.h"
 #include "bridge.h"
+#include "bridge_time.h"
 #include "bridge_port.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -80,6 +81,11 @@ static uint32_t s_last_seq;
 static uint32_t s_sync_ticks;
 static bridge_port_t *s_port;
 static uint32_t s_resume_seq;
+static uint32_t s_boot_id;
+static uint32_t s_seg_boot_id;
+static int64_t s_time_base;
+static bool s_time_synced;
+static bool s_initial_mount = true;
 
 static uint8_t *s_qbuf;
 static size_t s_qcap;
@@ -100,6 +106,7 @@ static bool sd_seg_id_ok(const char *id);
 static void sd_paths_for(const char *id, char paths[4][96]);
 static void sd_index_bounds_path(const char *path, uint32_t *count,
                                  uint32_t *first, uint32_t *last);
+static bool sd_q_idle(void);
 
 static void sd_lock(void)
 {
@@ -150,6 +157,57 @@ static void sd_close_segment_locked(void)
 }
 
 #define SD_ACK_MAGIC 0x5348414bU
+#define SD_TIME_MAGIC 0x5348544dU
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t boot_id;
+    int64_t epoch_base_ms;
+    uint32_t synced;
+    uint32_t reserved;
+} sd_time_meta_t;
+
+static void sd_time_path(const char *id, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s/time-%s.bin", SD_DIR, id);
+}
+
+static bool sd_read_time_path(const char *id, int64_t *base, bool *synced, uint32_t *boot_id)
+{
+    char path[160];
+    sd_time_path(id, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    sd_time_meta_t m = {0};
+    bool ok = fread(&m, sizeof(m), 1, f) == 1 && m.magic == SD_TIME_MAGIC;
+    fclose(f);
+    if (!ok) return false;
+    if (base) *base = m.epoch_base_ms;
+    if (synced) *synced = m.synced != 0;
+    if (boot_id) *boot_id = m.boot_id;
+    return true;
+}
+
+static bool sd_write_time_path(const char *id, uint32_t boot_id, int64_t base, bool synced)
+{
+    char path[160];
+    sd_time_path(id, path, sizeof(path));
+    sd_time_meta_t m = {
+        .magic = SD_TIME_MAGIC,
+        .boot_id = boot_id,
+        .epoch_base_ms = base,
+        .synced = synced ? 1U : 0U,
+        .reserved = 0,
+    };
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(&m, sizeof(m), 1, f) == 1;
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    return ok;
+}
+
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t rx;
@@ -416,8 +474,10 @@ typedef struct {
     uint32_t latest_seq[2];
     uint32_t acked_rx;
     uint32_t acked_tx;
+    int64_t epoch_base_ms;
     int64_t mtime_s;
     bool acked;
+    bool time_synced;
 } sd_scan_seg_t;
 
 /* Scan complete segment quads (raw/idx rx/tx). Newest last; active is set by caller. */
@@ -485,6 +545,11 @@ static int sd_scan_segments_locked(sd_scan_seg_t *out, int max, uint32_t *global
         }
         sd_read_ack_path(id, &seg.acked_rx, &seg.acked_tx);
         seg.acked = seg.acked_rx >= seg.latest_seq[0] && seg.acked_tx >= seg.latest_seq[1];
+        uint32_t boot_id = 0;
+        if (!sd_read_time_path(id, &seg.epoch_base_ms, &seg.time_synced, &boot_id)) {
+            seg.epoch_base_ms = 0;
+            seg.time_synced = false;
+        }
         seg.mtime_s = mtimes[0];
         for (int k = 1; k < 4; k++) {
             if (mtimes[k] > seg.mtime_s) {
@@ -640,6 +705,10 @@ static bool sd_open_existing_locked(const char *id)
         if (last > s_last_seq) s_last_seq = last;
     }
     s_sync_error = false;
+    s_seg_boot_id = 0;
+    s_time_base = 0;
+    s_time_synced = false;
+    sd_read_time_path(id, &s_time_base, &s_time_synced, &s_seg_boot_id);
     sd_repair_dir_locked(id, 0);
     sd_repair_dir_locked(id, 1);
     ESP_LOGI(TAG, "resume segment %s raw=%llu/%llu idx=%lu/%lu seq=%lu..%lu",
@@ -670,16 +739,34 @@ static esp_err_t sd_create_segment_locked(void)
     s_first_seq = 0;
     s_last_seq = 0;
     s_sync_error = false;
+    s_seg_boot_id = s_boot_id;
+    s_time_base = 0;
+    s_time_synced = false;
+    if (bridge_time_synced()) {
+        s_time_base = bridge_time_base_ms();
+        s_time_synced = s_time_base > 0;
+    }
+    sd_write_time_path(s_id, s_seg_boot_id, s_time_base, s_time_synced);
     ESP_LOGI(TAG, "new segment %s", s_id);
     bridge_event_push(BRIDGE_EVENT_INFO, "sd.segment", "new segment %s", s_id);
     return ESP_OK;
 }
 
-static esp_err_t sd_resume_or_create_locked(void)
+static esp_err_t sd_resume_or_create_locked(bool force_new)
 {
     sd_scan_seg_t segs[BRIDGE_SD_MAX_SEGMENTS];
     uint32_t global_latest = 0;
     int n = sd_scan_segments_locked(segs, BRIDGE_SD_MAX_SEGMENTS, &global_latest);
+    if (force_new) {
+        esp_err_t err = sd_create_segment_locked();
+        if (err == ESP_OK) {
+            s_resume_seq = global_latest;
+            bridge_event_push(BRIDGE_EVENT_INFO, "sd.new_boot",
+                              "new boot segment %s (previous latest seq=%lu)", s_id,
+                              (unsigned long)global_latest);
+        }
+        return err;
+    }
     if (n > 0) {
         int best = 0;
         for (int i = 1; i < n; i++) {
@@ -795,9 +882,10 @@ static esp_err_t sd_try_mount(int attempts)
         return ESP_OK;
     }
     sd_retention_locked();
-    err = sd_resume_or_create_locked();
+    err = sd_resume_or_create_locked(s_initial_mount && CONFIG_BRIDGE_NTP_ENABLE);
     if (err == ESP_OK) {
         s_mounted = true;
+        s_initial_mount = false;
         s_broken = false;
         s_mount_fail_count = 0;
     }
@@ -886,6 +974,14 @@ static void sd_sync_timer(void *arg)
     if (s_port) {
         bridge_port_log_flush_partial(s_port);
     }
+    if (!s_time_base && bridge_time_synced() && sd_q_idle()) {
+        /* A segment that started before NTP has an unknown tick->epoch base.
+         * Seal it and start a fresh, time-anchored segment. */
+        if (sd_rotate_locked() == ESP_OK) {
+            bridge_event_push(BRIDGE_EVENT_INFO, "time.rotate",
+                              "NTP synced; new time-anchored segment %s", s_id);
+        }
+    }
     if (++s_sync_ticks % RETENTION_EVERY == 0) {
         sd_retention_locked();
     }
@@ -909,6 +1005,9 @@ esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t *port)
     }
     s_enabled = true;
     s_bus_ready = spi_bus_ready;
+    s_boot_id = esp_random();
+    s_time_base = 0;
+    s_time_synced = false;
     s_qcap = CONFIG_BRIDGE_SD_QUEUE_BYTES;
     if (s_qcap < 65536) s_qcap = 65536;
     s_qbuf = (uint8_t *)heap_caps_malloc(s_qcap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1031,6 +1130,15 @@ static void sd_q_reset(void)
     xSemaphoreTake(s_qlock, portMAX_DELAY);
     sd_q_reset_locked();
     xSemaphoreGive(s_qlock);
+}
+
+static bool sd_q_idle(void)
+{
+    if (!s_qlock) return true;
+    xSemaphoreTake(s_qlock, portMAX_DELAY);
+    bool idle = s_qused == 0;
+    xSemaphoreGive(s_qlock);
+    return idle;
 }
 
 static bool sd_q_dequeue(sd_q_hdr_t *h, uint8_t *data)
@@ -1204,6 +1312,8 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
     out->broken = s_broken;
     out->earliest_seq = s_first_seq;
     out->latest_seq = s_last_seq;
+    out->epoch_base_ms = s_time_base;
+    out->time_synced = s_time_synced;
     snprintf(out->segment, sizeof(out->segment), "%s", s_id);
 
     sd_scan_seg_t segs[BRIDGE_SD_MAX_SEGMENTS];
@@ -1222,6 +1332,8 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
         d->acked_rx = segs[i].acked_rx;
         d->acked_tx = segs[i].acked_tx;
         d->acked = segs[i].acked;
+        d->epoch_base_ms = segs[i].epoch_base_ms;
+        d->time_synced = segs[i].time_synced;
         d->mtime_s = segs[i].mtime_s;
         d->active = strcmp(segs[i].id, s_id) == 0;
         if (d->active) {
@@ -1232,6 +1344,8 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
             if (s_raw_bytes[0] + s_raw_bytes[1] > d->raw_bytes) {
                 d->raw_bytes = s_raw_bytes[0] + s_raw_bytes[1];
             }
+            d->epoch_base_ms = s_time_base;
+            d->time_synced = s_time_synced;
             d->acked = d->acked_rx >= d->latest_rx && d->acked_tx >= d->latest_tx;
         }
     }
@@ -1265,6 +1379,9 @@ static void sd_unlink_segment_locked(const char *id)
     char ack[160];
     sd_ack_path(id, ack, sizeof(ack));
     unlink(ack);
+    char time_path[160];
+    sd_time_path(id, time_path, sizeof(time_path));
+    unlink(time_path);
 }
 
 static void sd_unlink_all_locked(void)
@@ -1278,7 +1395,7 @@ static void sd_unlink_all_locked(void)
         const char *name = de->d_name;
         if (!(strncmp(name, "raw-rx-", 7) == 0 || strncmp(name, "raw-tx-", 7) == 0 ||
               strncmp(name, "idx-rx-", 7) == 0 || strncmp(name, "idx-tx-", 7) == 0 ||
-              strncmp(name, "ack-", 4) == 0)) {
+              strncmp(name, "ack-", 4) == 0 || strncmp(name, "time-", 5) == 0)) {
             continue;
         }
         char full[320];
@@ -1384,6 +1501,20 @@ static uint32_t sd_idx_lower_bound(FILE *f, uint32_t n, uint32_t seq)
         }
     }
     return lo;
+}
+
+static void sd_time_for_segment_locked(const char *id, int64_t *base, bool *synced)
+{
+    if (strcmp(id, s_id) == 0) {
+        *base = s_time_base;
+        *synced = s_time_synced;
+        return;
+    }
+    uint32_t boot = 0;
+    if (!sd_read_time_path(id, base, synced, &boot)) {
+        *base = 0;
+        *synced = false;
+    }
 }
 
 esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t *out)
@@ -1516,6 +1647,7 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
         out->eof = true;
         out->next_cursor = req->cursor;
         snprintf(out->segment, sizeof(out->segment), "%s", seg);
+        sd_time_for_segment_locked(seg, &out->time_base_ms, &out->time_synced);
         sd_unlock();
         return ESP_OK;
     }
@@ -1556,6 +1688,7 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
     out->next_cursor = more ? next_index : 0;
     out->eof = !more;
     snprintf(out->segment, sizeof(out->segment), "%s", seg);
+    sd_time_for_segment_locked(seg, &out->time_base_ms, &out->time_synced);
 
     free(recs);
     sd_unlock();

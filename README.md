@@ -150,6 +150,11 @@ SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目�
 host `log_sync` 完整导出后会发 `LOG_ACK`，retention 只删除 `acked_rx/tx` 覆盖 latest 的
 segment；只有卡剩余空间低于 `BRIDGE_SD_UNACKED_FREE_MB` 时才强制删除最旧未归档段并记
 `sd.retention_unacked`。resume 会修复 index 尾和 orphan raw（`sd.repair`）。
+
+NTP 联网后自动启动（`ntp.aliyun.com`）；`LOG_STATS.time` 返回 `epoch_ms/synced/source`。
+NTP 首次同步时会封存“时间未知”的旧段并新建带 `epoch_base_ms` 的段；`LOG_QUERY.ts`
+直接是 epoch 毫秒（每条的 `ts_source` 标明 `ntp`/`tick`），`LOG_EXPORT` 也带
+`time_base_ms/time_synced`。
 `LOG_STATS.sd_queue` 显示 UART→SD 队列水位；`uart_overflow_bytes`/`ring.dropped_bytes`
 是 UART/ring 侧丢失计数。默认 UART 驱动缓冲 32 KiB、SD queue 3 MiB（可 menuconfig 调整）。
 每次启动/重挂载会扫描已有 segment，**续写最新完整段**并恢复 seq；达到
@@ -180,7 +185,8 @@ RAM ring used=262,144 (满)   dropped=1,306,717
 即 ring 已经覆盖不下，但 SD 完整保留了这 90 s；导出内容是可读的
 `[stcloud_init_camera] ... frame no` 文本。当前限制：只导出**本次启动的 segment**、
 导出页 32 KB/512 行；cursor 是索引序号，首屏按 seq 二分定位，之后 64 条/块读，
-通常 <1 s/页（WiFi 拥塞时会慢）。时间仍是 uptime（无 NTP）。
+通常 <1 s/页（WiFi 拥塞时会慢）。NTP 同步后 `LOG_QUERY.ts` 是 epoch；旧段
+`time_synced=false`，只能保留 tick 视图。
 
 ## 与主机联调
 
@@ -239,6 +245,7 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 1500000 --no-transact --toke
 | `BRIDGE_SD_UNACKED_FREE_MB` | 256 | 卡将满时强制删最旧未归档段 |
 | `BRIDGE_EVENT_ENTRIES` | 64 | 控制面事件环形队列 |
 | `BRIDGE_PROV_POP` | `abcd1234` | BLE Security1 PoP，二维码里带 |
+| `BRIDGE_NTP_ENABLE` / `BRIDGE_NTP_SERVER` | y / `ntp.aliyun.com` | 联网后 SNTP；日志带 epoch 时间锚点 |
 | `BRIDGE_PROV_BLE_PREFIX` | `PROV_` | 最终 BLE 名 `<prefix>XXXXXX` |
 | `BRIDGE_LCD_ENABLE` | y | 160×80 ST7789 显示二维码/状态 |
 | `BRIDGE_BUTTON_ENABLE` | y | GPIO0 长按恢复出厂配网 |
@@ -289,11 +296,9 @@ TX 的 `LOG_EXPORT` 精确回读；90 s 空闲窗口 SD 增长 472 KB / 6,296 �
 
 ## 已知限制 / 下一步
 
-1. **SD 跨重启导出**：当前只导出本次启动的 segment；旧 segment 仍在卡里，
-   但缺少协议级 segment 列表/导出。
-2. **时间**：无 NTP，`ts`/`time` 是 uptime（`source:"tick"`, `synced:false`）；
-   接 SNTP 后可对齐 epoch。
-3. **多端口**：目前固定 `uart0`；契约已支持 `port_id`。
+1. **多端口**：目前固定 `uart0`；契约已支持 `port_id`，双串口固件待实现。
+2. **时间过滤**：已有 NTP epoch 时间戳，但 `time_from/time_to` 尚未下推到设备。
+3. **SD 观测**：保留 ACK/retention/repair；仍需 3 GB 轮转与故障注入实测。
 4. **传输扩展**：`ws / udp / kcp / mqtt`（先做 `ws` 最省事，复用同一 NDJSON）。
 5. **断线重连状态**：当前 host 重连即重新 `HELLO`，用 `next_offset` 续拉；
    设备侧无会话，符合 v0。
