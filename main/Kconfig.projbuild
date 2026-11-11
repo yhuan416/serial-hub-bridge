@@ -1,0 +1,181 @@
+menu "serial-hub-bridge"
+
+    menu "Network / provisioning"
+
+        config BRIDGE_TCP_PORT
+            int "TCP listen port"
+            range 1 65535
+            default 7000
+            help
+                The host connects with tcp://<ip>:<port>.
+
+        config BRIDGE_AUTH_TOKEN
+            string "HELLO token (empty = no auth)"
+            default ""
+            help
+                When non-empty, HELLO must carry the same token, and every
+                other op before HELLO is rejected with `unauthorized`.
+                v0 is plaintext: use a trusted LAN / VPN.
+
+        config BRIDGE_PROV_POP
+            string "BLE provisioning PoP"
+            default "abcd1234"
+            help
+                Proof-of-possession for protocomm Security1. It is embedded in
+                the QR payload shown on the LCD, so the provisioning app reads
+                it by scanning. Use a per-device value for production.
+
+        config BRIDGE_PROV_BLE_PREFIX
+            string "BLE service-name prefix"
+            default "PROV_"
+            help
+                Final BLE name is "<prefix>XXXXXX" (last three MAC bytes).
+                The ESP BLE Provisioning app filters by this name / service UUID.
+
+        config BRIDGE_LCD_ENABLE
+            bool "Show QR/status on the 160x80 ST7789 LCD"
+            default y
+            help
+                Alientek ESP32-S3 board wiring (SPI2: SCLK=12 MOSI=11 MISO=13,
+                DC=40 CS=39 RST=38 PWR=41). If the panel is absent the QR is
+                still printed in the serial log.
+
+        config BRIDGE_BUTTON_ENABLE
+            bool "Enable long-press factory reset button"
+            default y
+            help
+                Long-press clears WiFi provisioning and reboots back into BLE
+                provisioning mode.
+
+        config BRIDGE_BUTTON_GPIO
+            int "Factory reset GPIO"
+            default 0
+            depends on BRIDGE_BUTTON_ENABLE
+
+        config BRIDGE_BUTTON_LONG_PRESS_MS
+            int "Factory reset long-press (ms)"
+            range 1000 30000
+            default 5000
+            depends on BRIDGE_BUTTON_ENABLE
+
+    endmenu
+
+    menu "UART"
+
+        config BRIDGE_UART_NUM
+            int "UART peripheral number"
+            range 0 2
+            default 1
+            help
+                Prefer 1: UART0 is usually the console.
+
+        config BRIDGE_UART_TX_GPIO
+            int "TX GPIO"
+            default 17
+
+        config BRIDGE_UART_RX_GPIO
+            int "RX GPIO"
+            default 18
+
+        config BRIDGE_UART_RTS_GPIO
+            int "RTS GPIO (-1 = not wired)"
+            default -1
+            help
+                Required for SET_LINES(rts) and flow_control=rtscts.
+                Typical auto-reset wiring: RTS -> EN (active low).
+
+        config BRIDGE_UART_CTS_GPIO
+            int "CTS GPIO (-1 = not wired)"
+            default -1
+            help
+                Required for flow_control=rtscts.
+
+        config BRIDGE_UART_DTR_GPIO
+            int "DTR GPIO (-1 = not wired)"
+            default -1
+            help
+                UART DTR is not a native signal here, so DTR is driven by this
+                plain GPIO (active low). Typical: DTR -> GPIO0 for ESP download.
+
+        config BRIDGE_UART_BAUD
+            int "Default baud rate"
+            range 50 5000000
+            default 115200
+
+        config BRIDGE_UART_DATA_BITS
+            int "Default data bits"
+            range 5 8
+            default 8
+
+        config BRIDGE_UART_STOP_BITS
+            int "Default stop bits"
+            range 1 2
+            default 1
+
+        config BRIDGE_UART_RX_BUF
+            int "UART driver RX/TX buffer bytes"
+            range 512 65536
+            default 8192
+            help
+                Driver-level FIFO buffer. The v0 READ ring is separate.
+
+    endmenu
+
+    menu "Buffers / limits"
+
+        config BRIDGE_RING_BYTES
+            int "RX ring size (bytes)"
+            range 8192 4194304
+            default 262144
+            help
+                Absolute-offset RAM ring that READ pulls from. Bytes beyond this
+                are dropped oldest-first and reported as ring.dropped_bytes.
+                Use PSRAM for >= 1 MiB.
+
+        config BRIDGE_MAX_FRAME
+            int "Max NDJSON frame / response bytes"
+            range 1024 131072
+            default 32768
+            help
+                Also caps READ.max_bytes. Larger values need more heap because
+                the response carries base64 (4/3) and JSON copies.
+
+        config BRIDGE_MAX_HOLD_MS
+            int "Max READ hold (ms)"
+            range 100 60000
+            default 10000
+            help
+                Host max_wait_ms is clamped to this and flagged hold_clamped.
+
+    endmenu
+
+    menu "Line log (RAM)"
+
+        config BRIDGE_LOG_ENTRIES
+            int "Retained log entries"
+            range 0 2048
+            default 256
+            help
+                Bounded RAM index for LOG_QUERY/LOG_STATS. 0 disables the log.
+                The device-authoritative SD log is a later milestone; until then
+                caps.log_storage is "ram".
+
+        config BRIDGE_LOG_LINE_MAX
+            int "Max stored bytes per line"
+            range 16 1024
+            default 192
+            help
+                Longer lines are truncated in `line`/`hex` but keep their full
+                length in `bytes` and set truncated=true.
+
+        config BRIDGE_LOG_PARTIAL_MAX
+            int "Max bytes for an unterminated line"
+            range 64 8192
+            default 1024
+            help
+                When an RX line grows past this without '\n', it is logged as a
+                truncated entry and assembly restarts.
+
+    endmenu
+
+endmenu

@@ -1,0 +1,4 @@
+idf_component_register(
+    SRCS "spilcd.c" "bridge_display.c"
+    INCLUDE_DIRS "." "include"
+    REQUIRES esp_lcd qrcodegen esp_driver_spi esp_driver_gpio)

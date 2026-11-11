@@ -1,0 +1,13 @@
+build/
+build-host/
+sdkconfig
+sdkconfig.old
+sdkconfig.board
+managed_components/
+.vscode/
+.idea/
+*.o
+*.a
+*.bin
+*.elf
+*.map

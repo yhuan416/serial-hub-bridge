@@ -1,0 +1,242 @@
+# serial-hub-bridge
+
+ESP32-S3 无线串口桥（**设备侧 v0**），对接
+[`serial-hub-mcp`](../serial-hub-mcp) 的远端链路契约：
+[`docs/remote-link-protocol.md`](../serial-hub-mcp/docs/remote-link-protocol.md)。
+
+一个独立、最小化的 ESP-IDF 工程：**UART ↔ WiFi/TCP/NDJSON**，不带 BSP、LVGL、USB CDC、
+业务 App。参考了 `Wireless_USB_CDC_ACM` 的 `feat/esp_idf` 分支里 `uart_port` /
+`cdc_uart_bridge` / `sdlog` 的驱动与环形缓冲写法，但代码是重新组织的，不依赖那个仓库。
+
+```
+┌──────────┐   UART    ┌──────────────────────────┐   TCP/NDJSON   ┌────────────────┐
+│ 目标板/  │◄─────────►│  serial-hub-bridge (S3)  │◄──────────────►│ serial-hub-mcp │
+│ 被调试设备│  TX/RX    │  ring + offsets + log    │  request/ack   │  (host, MCP)   │
+└──────────┘           └──────────────────────────┘                └────────────────┘
+```
+
+更细的分层、READ 决策与取舍见 [docs/design.md](docs/design.md)。
+
+## 已实现（v0）
+
+| op | 状态 | 说明 |
+|---|---|---|
+| `HELLO` | ✅ | `proto:"v0"`、token 鉴权、caps/ports/time |
+| `CONFIG` | ✅ | baud / data_bits / stop_bits / parity / flow_control |
+| `WRITE` | ✅ | 一帧一次写，返回 `tx_offset` / `tx_log_seq` |
+| `READ` | ✅ | long-poll：`match` / `min_bytes` / `max_bytes` / `idle` / `budget` |
+| `TRANSACT` | ✅ | 设备侧 `barrier_offset`，排除写前字节 |
+| `SET_LINES` | ✅（按接线） | RTS 走 UART，DTR 走普通 GPIO；未接线返回 `unsupported` |
+| `BREAK` | ✅（需实机确认） | `uart_write_bytes_with_break(size=0)` |
+| `PING` | ✅ | `t_ms` 回显 + `device_tick_ms` |
+| `LOG_STATS` | ✅ | ring 水位 + RAM 行日志统计 |
+| `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor` |
+| `LOG_CLEAR` | ✅ | 清 RAM 日志（`log_seq` 不回退） |
+| `LOG_EXPORT` | ✖ `not_impl` | 设备权威 SD 日志是下一步；`caps.log_export=false` |
+| `INFO` / `LIST_PORTS` / `CLOSE` | ✅ | |
+
+`caps`（HELLO 返回）当前为：`auth` 按 token、`has_sd:false`、`log_storage:"ram"`、
+`can_set_lines` 按接线、`can_break:true`、`can_config:true`、`binary_frames:false`。
+
+## 数据面语义（与主机一致）
+
+- **绝对偏移 0-based**：`rx_offset` = 已接收字节数，下一个字节位置就是它；
+  `READ.from_offset = N` 返回位置 `>= N` 的字节。
+- **TRANSACT 屏障**：设备在受理写之前取 `barrier`，响应只从 `barrier` 起，
+  等价于本机 `Connection` 的 `base = _length`。
+- **gap**：`from_offset < ring_start_offset` 时 `gap=true`，从 `ring_start_offset` 起返回；
+  host 会把它计入 `rx_dropped`。
+- **结束优先级**：`match > max_bytes/min_bytes > idle > budget`，
+  `stopped_reason ∈ {match, max_bytes, min_bytes, idle, budget}`。
+- **幂等**：`READ` 只读不消耗；`WRITE/TRANSACT` 支持 `op_id` 去重（32 条 / 60s，
+  结果 ≤ 16 KiB 才缓存；重复请求返回首次结果并置 `deduped:true`）。
+- **背压**：ring 满丢最旧，`LOG_STATS.ring.dropped_bytes` 单调递增。
+
+## 快速开始
+
+前置：ESP-IDF（**v6.1 已完整编译验证**；5.2+ 的驱动拆分已在 CMake 里做条件兼容），目标 `esp32s3`。
+
+```bash
+# 1) 配置 UART 引脚 / 可选的首次 WiFi 种子（WiFi 也可以先不填，进 AP 配网页设置）
+idf.py menuconfig      # serial-hub-bridge -> Provisioning portal, UART
+
+# 2) 构建 + 烧录 + 监视
+idf.py set-target esp32s3
+idf.py build
+idf.py -p /dev/ttyACM0 flash monitor
+```
+
+首次构建会通过组件管理器拉取 `espressif/cjson` 到 `managed_components/`（已 gitignore），
+需要能访问 components.espressif.com；离线环境可把该目录预置好。
+
+当前镜像约 **1.25 MB**（含 BLE/NimBLE + LVGL 无关的 LCD 驱动 + 二维码）。
+本机验证板是 16 MB flash + 8 MB PSRAM，构建时使用本地 `sdkconfig.board`
+（已 gitignore）启用 PSRAM、NimBLE 和 4 MB factory 分区：
+
+```bash
+SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board" idf.py build
+```
+
+启动日志会打印：
+
+```
+I (1234) bridge_net: got ip 192.168.1.50
+I (1235) bridge_net: listening on tcp://0.0.0.0:7000 (proto v0)
+```
+
+默认接线（可在 menuconfig 改）：
+
+| 信号 | 默认 | 说明 |
+|---|---|---|
+| UART | 1 | 避免占用 UART0 console |
+| TX | GPIO17 | |
+| RX | GPIO18 | 上拉 |
+| RTS | 未接 | 接 EN 可做复位（`SET_LINES rts`，低有效） |
+| CTS | 未接 | `flow_control=rtscts` 时必需 |
+| DTR | 未接 | 接 GPIO0 可做下载模式（低有效） |
+
+## 配网（二维码 + BLE）
+
+使用 ESP-IDF 的 **`network_provisioning`**（IDF 6.x 的 `wifi_provisioning` 继任者），
+BLE Security1 + PoP，二维码就是官方 payload：
+
+```json
+{"ver":"v1","name":"PROV_00B160","pop":"abcd1234","transport":"ble"}
+```
+
+- BLE 名：`<BRIDGE_PROV_BLE_PREFIX><MAC 末三字节>`，默认 `PROV_00B160`
+- PoP：`BRIDGE_PROV_POP`，默认 `abcd1234`（量产应逐台不同，并随二维码下发）
+- 未配网：160×80 ST7789 显示二维码（33 modules × scale 2 = **66×66 px**），
+  串口同时打印 `QR payload: ...`；用 ESP BLE Provisioning App 扫码即可
+- 配网成功：隐藏二维码、显示 SSID/IP；串口桥在设备 STA IP 的 7000 端口
+- 长按 **GPIO0 5 秒**：`network_prov_mgr_reset_wifi_provisioning()` + 重启，回到配网模式
+  （也可调用 `bridge_prov_factory_reset()`）
+- 凭据由 provisioning manager / WiFi 驱动存 NVS；`bridge_prov` 只负责状态与显示
+
+LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
+
+| 信号 | GPIO |
+|---|---|
+| SCLK / MOSI / MISO | 12 / 11 / 13 |
+| DC / CS / RST / PWR | 40 / 39 / 38 / 41 |
+
+板子不同就改 `components/display/spilcd.h` 的引脚宏；LCD 初始化失败不影响 BLE 配网，
+二维码仍会打印在串口日志里。
+
+## 与主机联调
+
+主机侧（Node ≥ 18）：
+
+```bash
+cd ../serial-hub-mcp
+npm install && npm test          # 62 项，含 fake bridge
+npx serial-hub-mcp               # 或 node src/server.js
+```
+
+MCP 工具调用示例（`endpoint` 指向设备 IP；本机摄像头目标为 **921600 8N1**）：
+
+```text
+open({ transport: "remote", endpoint: "tcp://192.168.1.50:7000",
+       baud_rate: 921600, token: "<token>" })
+transact({ connection_id: "...", data: "AT", newline: "crlf", match: "OK", timeout_ms: 2000 })
+receive({ connection_id: "...", start: "flush", budget_ms: 3000, idle_timeout_ms: 300 })
+get_status({ connection_id: "..." })     # remote.caps / gap_count / fw_version
+dump_to_file({ connection_id: "...", budget_ms: 10000 })
+close({ connection_id: "..." })
+```
+
+不装 MCP 也能做裸协议冒烟（纯 Node，无依赖）：
+
+```bash
+node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 921600 --no-transact --token <token>
+```
+
+它会依次跑 `HELLO → CONFIG → WRITE/READ → TRANSACT → LOG_STATS → CLOSE` 并断言字段。
+
+> 注意：v0 是明文链路。跨不可信网络请套 VPN / SSH 隧道；token 只是最低门槛。
+
+## 配置项
+
+| Kconfig | 默认 | 说明 |
+|---|---|---|
+| `BRIDGE_TCP_PORT` | 7000 | |
+| `BRIDGE_AUTH_TOKEN` | 空 | 空 = 关闭鉴权（`caps.auth=false`） |
+| `BRIDGE_UART_NUM` | 1 | |
+| `BRIDGE_UART_TX_GPIO` / `RX_GPIO` | 17 / 18 | |
+| `BRIDGE_UART_RTS_GPIO` / `CTS_GPIO` / `DTR_GPIO` | -1 | -1 = 未接线 |
+| `BRIDGE_UART_BAUD` | 115200 | CONFIG 可运行时改 |
+| `BRIDGE_RING_BYTES` | 262144 | ≥1 MiB 建议开 PSRAM |
+| `BRIDGE_MAX_FRAME` | 32768 | 同时限制 `READ.max_bytes` |
+| `BRIDGE_MAX_HOLD_MS` | 10000 | 超过被 clamp 并回 `hold_clamped` |
+| `BRIDGE_LOG_ENTRIES` | 256 | 0 = 关闭 RAM 行日志 |
+| `BRIDGE_LOG_LINE_MAX` | 192 | 超长行截断（`bytes` 仍为全长） |
+| `BRIDGE_PROV_POP` | `abcd1234` | BLE Security1 PoP，二维码里带 |
+| `BRIDGE_PROV_BLE_PREFIX` | `PROV_` | 最终 BLE 名 `<prefix>XXXXXX` |
+| `BRIDGE_LCD_ENABLE` | y | 160×80 ST7789 显示二维码/状态 |
+| `BRIDGE_BUTTON_ENABLE` | y | GPIO0 长按恢复出厂配网 |
+| `BRIDGE_BUTTON_LONG_PRESS_MS` | 5000 | 长按阈值 |
+
+内存粗略：ring（默认 256 KiB）+ 行日志（256 × (192+40) ≈ 58 KiB）+ 部分行 1 KiB
++ 响应 scratch 32 KiB + 运行时 base64/JSON 峰值。无 PSRAM 的 S3 建议把
+`BRIDGE_RING_BYTES` 降到 128 KiB、`BRIDGE_MAX_FRAME` 降到 16 KiB。
+
+## 主机侧纯逻辑测试
+
+`bridge_ring` / `bridge_read` 不依赖 ESP-IDF，可直接在 PC 上验证 v0 的停止条件、
+跨环匹配、gap、屏障等（不需要硬件）：
+
+```bash
+./test/run.sh
+# ring/read: all checks passed
+```
+
+固件已用 **ESP-IDF v6.1** 做过 `fullclean && build`：0 warning，镜像约 **1.25 MB**
+（4 MB factory 分区）。实机已验证：16 MB flash / 8 MB PSRAM、160×80 ST7789 LCD ready、
+二维码 66×66 px、BLE `PROV_00B160` 广播；App 配网成功后设备地址为 `<device-ip>`，主机跑
+
+```bash
+node tools/smoke.mjs tcp://<device-ip>:7000 --no-transact
+```
+
+HELLO / CONFIG / WRITE / READ / LOG_STATS / PING / CLOSE 全部通过。
+（`CONFIG` 曾因 `uart_set_hw_flow_ctrl` 阈值给了 128 返回 ESP_FAIL，已改为 0/127。）
+
+接上摄像头后确认目标波特率为 **921600 8N1**：8 秒抓到 31,834 B，可打印率 97%、
+UTF-8 非法 0；`LOG_QUERY` 能解析出：
+
+```
+[stcloud_init_camera] live_stream_read_callback_impl ... frame no :407 ...
+ai detect ret:0 cnt:0 ch:0 w:416 h:224 ...
+CPU Usage: 41%
+```
+
+1500000 / 2000000 下是乱码。`TRANSACT` 需要目标能应答；当前摄像头是持续日志，
+用 `--no-transact`。host 侧 `open` 记得带 `baud_rate: 921600`（或存 profile）。
+
+## 已知限制 / 下一步
+
+1. **设备权威 SD 日志**：`LOG_EXPORT` + `raw+index` 落盘（当前 `LOG_STORAGE=ram`）。
+2. **时间**：无 NTP，`ts`/`time` 是 uptime（`source:"tick"`, `synced:false`）；
+   接 SNTP 后可对齐 epoch。
+3. **多端口**：目前固定 `uart0`；契约已支持 `port_id`。
+4. **传输扩展**：`ws / udp / kcp / mqtt`（先做 `ws` 最省事，复用同一 NDJSON）。
+5. **断线重连状态**：当前 host 重连即重新 `HELLO`，用 `next_offset` 续拉；
+   设备侧无会话，符合 v0。
+6. **压缩 / 二进制帧**（v1）。
+7. **OTA**：当前 4 MB factory 单分区，后续可加 ota_0/ota_1。
+8. `BREAK` 依赖 IDF 的 `uart_write_bytes_with_break(size=0)`，需在实机上确认；
+   若你的 IDF 版本不生效，可改成 GPIO 拉低 TX 的方案。
+9. **配网安全**：当前 Security1 + 固定 PoP；量产建议逐台 PoP 或 Security2（SRP6a）。
+   重新配网：长按 GPIO0 5 秒（清凭据 + 重启），或调 `bridge_prov_factory_reset()`。
+10. **LCD 引脚**：固定为正点原子 ESP32-S3 板；换板需改 `spilcd.h`。
+
+## 与 `feat/esp_idf` 的关系
+
+参考了其 `components/uart_port`（UART 驱动封装、line coding 映射）、
+`components/cdc_uart_bridge`（PSRAM ring、绝对游标思路）、`components/sdlog`（按时间
+切文件、flush 任务）。本工程刻意**不**引入 BSP / LVGL / USB CDC / App 框架，
+只保留 v0 需要的最小闭环，便于单独维护和烧到任意 S3 板。
+
+## License
+
+MIT（与 `serial-hub-mcp` 一致）。

@@ -1,0 +1,44 @@
+/*
+ * Shared state for the v0 serial bridge.
+ *
+ * This firmware implements the device side of
+ * serial-hub-mcp/docs/remote-link-protocol.md (proto "v0"):
+ * NDJSON request/response over TCP, pull-only, absolute byte offsets.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "bridge_port.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define BRIDGE_PROTO_VERSION "v0"
+#define BRIDGE_FW_VERSION "0.1.0"
+#define BRIDGE_PORT_ID "uart0"
+#define BRIDGE_PORT_KIND "uart"
+
+typedef struct bridge_ctx {
+    bridge_port_t *port;
+
+    /* NULL or empty => HELLO token auth disabled (caps.auth=false). */
+    const char *token;
+
+    uint32_t max_frame;
+    uint32_t max_hold_ms;
+
+    /* Reused by READ/TRANSACT to stage at most max_frame response bytes. */
+    uint8_t *scratch;
+    size_t scratch_cap;
+} bridge_ctx_t;
+
+/* Milliseconds since boot (monotonic; used for v0 tick timing). */
+uint64_t bridge_now_ms(void);
+
+#ifdef __cplusplus
+}
+#endif
