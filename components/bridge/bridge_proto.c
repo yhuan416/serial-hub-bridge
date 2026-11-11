@@ -10,6 +10,7 @@
 #include "sdkconfig.h"
 
 #include "bridge_port.h"
+#include "bridge_sd.h"
 
 #define TAG "bridge_proto"
 
@@ -314,7 +315,8 @@ static cJSON *build_caps(bridge_ctx_t *ctx)
         return NULL;
     }
     cJSON_AddBoolToObject(caps, "auth", ctx->token && ctx->token[0]);
-    cJSON_AddBoolToObject(caps, "has_sd", false);
+    const bool has_sd = bridge_sd_ready();
+    cJSON_AddBoolToObject(caps, "has_sd", has_sd);
     cJSON_AddNumberToObject(caps, "ring_bytes", cfg ? (double)cfg->ring_bytes : 0);
     cJSON_AddNumberToObject(caps, "max_hold_ms", (double)ctx->max_hold_ms);
     cJSON_AddNumberToObject(caps, "max_frame", (double)ctx->max_frame);
@@ -326,8 +328,8 @@ static cJSON *build_caps(bridge_ctx_t *ctx)
     cJSON_AddItemToArray(lf, cJSON_CreateString("seq"));
     cJSON_AddItemToArray(lf, cJSON_CreateString("dir"));
 
-    cJSON_AddStringToObject(caps, "log_storage", "ram");
-    cJSON_AddBoolToObject(caps, "log_export", false);
+    cJSON_AddStringToObject(caps, "log_storage", has_sd ? "raw+index" : "ram");
+    cJSON_AddBoolToObject(caps, "log_export", has_sd);
     cJSON_AddBoolToObject(caps, "binary_frames", false);
     if (cfg) {
         cJSON_AddNumberToObject(caps, "log_line_max_bytes", (double)cfg->log_line_max);
@@ -734,18 +736,45 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
     bridge_port_stat_t st;
     bridge_port_stat(ctx->port, &st);
 
+    bridge_sd_status_t sd;
+    bridge_sd_get_status(&sd);
+    const bool use_sd = sd.mounted;
+
     uint32_t seq = 0;
-    bool has_earliest = bridge_port_log_earliest_seq(ctx->port, &seq);
+    bool has_earliest = false;
+    uint32_t latest_seq = 0;
+    uint64_t capacity = 0;
+    uint64_t used = 0;
+    if (use_sd) {
+        has_earliest = sd.earliest_seq != 0;
+        seq = sd.earliest_seq;
+        latest_seq = sd.latest_seq;
+        capacity = sd.capacity_bytes;
+        used = sd.used_bytes;
+    } else {
+        has_earliest = bridge_port_log_earliest_seq(ctx->port, &seq);
+        latest_seq = bridge_port_log_latest_seq(ctx->port);
+        capacity = bridge_port_log_capacity_bytes(ctx->port);
+        used = bridge_port_log_used_bytes(ctx->port);
+    }
 
     cJSON *r = cJSON_CreateObject();
-    cJSON_AddNumberToObject(r, "capacity_bytes", (double)bridge_port_log_capacity_bytes(ctx->port));
-    cJSON_AddNumberToObject(r, "used_bytes", (double)bridge_port_log_used_bytes(ctx->port));
+    cJSON_AddNumberToObject(r, "capacity_bytes", (double)capacity);
+    cJSON_AddNumberToObject(r, "used_bytes", (double)used);
     if (has_earliest) {
         cJSON_AddNumberToObject(r, "earliest_seq", seq);
     } else {
         cJSON_AddNullToObject(r, "earliest_seq");
     }
-    cJSON_AddNumberToObject(r, "latest_seq", (double)bridge_port_log_latest_seq(ctx->port));
+    cJSON_AddNumberToObject(r, "latest_seq", (double)latest_seq);
+    cJSON_AddStringToObject(r, "source", "device");
+    cJSON_AddBoolToObject(r, "authoritative", true);
+    cJSON_AddStringToObject(r, "storage", use_sd ? "raw+index" : "ram");
+    if (use_sd) {
+        cJSON_AddStringToObject(r, "segment", sd.segment);
+        cJSON_AddNumberToObject(r, "raw_bytes", (double)sd.raw_bytes);
+        cJSON_AddNumberToObject(r, "index_count", (double)sd.index_count);
+    }
 
     cJSON *ring = cJSON_AddObjectToObject(r, "ring");
     cJSON_AddNumberToObject(ring, "bytes", (double)st.ring_capacity);
@@ -897,10 +926,89 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     return make_ok(id, r);
 }
 
+static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
+{
+    const cJSON *id = jid(msg);
+    if (!bridge_sd_ready()) {
+        return make_err(id, "unsupported", "no SD card (log_storage=ram)");
+    }
+
+    bridge_sd_export_req_t req;
+    memset(&req, 0, sizeof(req));
+    const char *dir = jstr(msg, "dir");
+    if (!dir || strcmp(dir, "rx") == 0) {
+        req.dir = 0;
+    } else if (strcmp(dir, "tx") == 0) {
+        req.dir = 1;
+    } else {
+        return make_err(id, "bad_request", "dir must be rx|tx");
+    }
+
+    uint32_t v;
+    if (ju32(msg, "seq_from", &v)) {
+        req.has_seq_from = true;
+        req.seq_from = v;
+    }
+    if (ju32(msg, "seq_to", &v)) {
+        req.has_seq_to = true;
+        req.seq_to = v;
+    }
+    if (ju32(msg, "max_bytes", &v)) {
+        req.max_bytes = v;
+    }
+    const char *cursor = jstr(msg, "cursor");
+    if (cursor && cursor[0]) {
+        req.cursor = strtoull(cursor, NULL, 10);
+    }
+    uint64_t c64;
+    if (ju64(msg, "cursor", &c64)) {
+        req.cursor = c64;
+    }
+
+    bridge_sd_export_t ex;
+    esp_err_t err = bridge_sd_export(&req, &ex);
+    if (err != ESP_OK) {
+        return make_err(id, "io_error", esp_err_to_name(err));
+    }
+
+    char *chunk_b64 = b64_encode_alloc(ex.chunk, ex.chunk_len);
+    char *index_b64 = b64_encode_alloc(ex.index, ex.index_len);
+    if (!chunk_b64 || !index_b64) {
+        free(chunk_b64);
+        free(index_b64);
+        bridge_sd_export_free(&ex);
+        return make_err(id, "io_error", "OOM building LOG_EXPORT response");
+    }
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "chunk_b64", chunk_b64);
+    cJSON_AddStringToObject(r, "index_b64", index_b64);
+    cJSON_AddNumberToObject(r, "bytes", (double)ex.chunk_len);
+    if (ex.eof) {
+        cJSON_AddNullToObject(r, "next_cursor");
+    } else {
+        char cur[24];
+        snprintf(cur, sizeof(cur), "%llu", (unsigned long long)ex.next_cursor);
+        cJSON_AddStringToObject(r, "next_cursor", cur);
+    }
+    cJSON_AddBoolToObject(r, "eof", ex.eof);
+    cJSON_AddStringToObject(r, "source", "device");
+    cJSON_AddBoolToObject(r, "authoritative", true);
+    cJSON_AddStringToObject(r, "time_source", "tick");
+
+    free(chunk_b64);
+    free(index_b64);
+    bridge_sd_export_free(&ex);
+    return make_ok(id, r);
+}
+
 static char *handle_log_clear(bridge_ctx_t *ctx, const cJSON *msg)
 {
     const cJSON *id = jid(msg);
     bridge_port_log_clear(ctx->port);
+    if (bridge_sd_ready()) {
+        bridge_sd_clear();
+    }
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "cleared", true);
     return make_ok(id, r);
@@ -1020,7 +1128,7 @@ char *bridge_proto_handle(bridge_ctx_t *ctx,
     } else if (strcmp(op, "LOG_CLEAR") == 0) {
         out = handle_log_clear(ctx, msg);
     } else if (strcmp(op, "LOG_EXPORT") == 0) {
-        out = make_err(id, "not_impl", "LOG_EXPORT is not implemented (log_storage=ram)");
+        out = handle_log_export(ctx, msg);
     } else if (strcmp(op, "CLOSE") == 0) {
         cJSON *r = cJSON_CreateObject();
         cJSON_AddStringToObject(r, "port", BRIDGE_PORT_ID);

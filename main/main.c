@@ -12,9 +12,11 @@
 #include "sdkconfig.h"
 
 #include "bridge.h"
+#include "bridge_display.h"
 #include "bridge_net.h"
 #include "bridge_port.h"
 #include "bridge_proto.h"
+#include "bridge_sd.h"
 
 static const char *TAG = "app";
 
@@ -41,6 +43,15 @@ void app_main(void)
         .log_line_max = CONFIG_BRIDGE_LOG_LINE_MAX,
         .log_partial_max = CONFIG_BRIDGE_LOG_PARTIAL_MAX,
     };
+
+#if CONFIG_BRIDGE_LCD_ENABLE
+    if (bridge_display_init() != ESP_OK) {
+        ESP_LOGW(TAG, "LCD init failed; QR only in the serial log");
+    }
+#endif
+    if (bridge_sd_init(bridge_display_ready()) != ESP_OK) {
+        ESP_LOGW(TAG, "SD log unavailable; RAM-only mode");
+    }
 
     bridge_port_t *port = bridge_port_init(&pc);
     if (!port) {

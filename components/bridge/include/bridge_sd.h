@@ -1,0 +1,86 @@
+/*
+ * Device-authoritative SD log: raw bytes + fixed-size line index.
+ *
+ * Layout (current segment):
+ *   /sdcard/shb/raw-<epoch>-<rand>.bin   raw RX/TX bytes, append-only
+ *   /sdcard/shb/idx-<epoch>-<rand>.bin   sd_idx_rec_t, one per line/TX write
+ *
+ * The RAM ring stays the live window for READ; SD is the durable history used
+ * by LOG_STATS / LOG_EXPORT after the agent comes back.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Packed 20-byte index record. `offset` is the per-boot RX/TX absolute offset
+ * of the line start; `len` is the raw span (including CR/LF) or the TX length. */
+typedef struct __attribute__((packed)) {
+    uint64_t offset;
+    uint32_t seq;
+    uint32_t tick_ms; /* uptime ms */
+    uint16_t len;
+    uint8_t dir; /* 0=rx, 1=tx */
+    uint8_t reserved;
+} sd_idx_rec_t;
+
+typedef struct {
+    bool mounted;
+    uint64_t capacity_bytes;
+    uint64_t used_bytes;
+    uint64_t free_bytes;
+    uint64_t raw_bytes;   /* current segment */
+    uint32_t index_count; /* current segment */
+    uint32_t earliest_seq;
+    uint32_t latest_seq;
+    char segment[40];
+} bridge_sd_status_t;
+
+typedef struct {
+    uint8_t dir; /* 0=rx, 1=tx; 0xff=any (not supported for export) */
+    bool has_seq_from;
+    uint32_t seq_from;
+    bool has_seq_to;
+    uint32_t seq_to;
+    uint64_t cursor;     /* raw offset, 0 = start */
+    uint32_t max_bytes;  /* clamp to BRIDGE_SD_EXPORT_CHUNK */
+} bridge_sd_export_req_t;
+
+typedef struct {
+    uint8_t *chunk; /* raw bytes */
+    size_t chunk_len;
+    uint8_t *index; /* sd_idx_rec_t[] with offset relative to chunk start */
+    size_t index_len;
+    bool eof;
+    uint64_t next_cursor;
+} bridge_sd_export_t;
+
+esp_err_t bridge_sd_init(bool spi_bus_ready);
+bool bridge_sd_ready(void);
+void bridge_sd_sync(void);
+
+/* Raw append (called from the UART RX/TX path). */
+void bridge_sd_log_rx(const uint8_t *data, size_t len);
+void bridge_sd_log_tx(const uint8_t *data, size_t len);
+
+/* One index record per completed RX line (raw_len includes CR/LF) or TX write. */
+void bridge_sd_index_line(uint32_t seq, int64_t tick_ms, uint8_t dir,
+                          uint64_t offset, uint32_t raw_len);
+
+void bridge_sd_get_status(bridge_sd_status_t *out);
+
+/* Export one page. Caller frees `out` with bridge_sd_export_free(). */
+esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t *out);
+void bridge_sd_export_free(bridge_sd_export_t *out);
+esp_err_t bridge_sd_clear(void);
+
+#ifdef __cplusplus
+}
+#endif

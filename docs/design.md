@@ -16,7 +16,7 @@
 **非目标（v0）**
 
 - 设备主动推流、压缩、二进制帧、TLS、多 host 共享。
-- 设备权威 SD 日志与 `LOG_EXPORT`（预留）。
+- 跨重启 SD segment 列表/导出（当前只导出本次启动的 segment）。
 - 多端口（固定 `uart0`，但协议字段已处理：其它 `port` 返回 `port_not_found`）。
 
 ## 2. 代码分层
@@ -108,18 +108,31 @@ READ(from_offset = barrier)
 这样 RTT 期间对端主动吐出的字节不会被误算成响应。响应里回 `barrier_offset`、
 `tx_offset`、`tx_log_seq`。host 不应自己用 `WRITE + READ` 拼，否则屏障不精确。
 
-## 7. 行日志（RAM，非权威）
+## 7. 行日志与 SD 权威存储
+
+### RAM 行日志（live）
 
 - 固定 N 条元数据 + N × `log_line_max` 文本槽；写满后覆盖最旧（`log_head` 前进）。
 - RX 按 `\n` 切行、剥尾部 `\r`；超过 `log_partial_max` 未换行则作为截断条目落一条。
 - TX 一次 write 一条。
 - `line` 为 ASCII 安全化视图（非可打印替换为 `.`），`hex` 是事实源；
   超长行截断时 `bytes` 仍是全长并置 `truncated:true`。
-- `LOG_QUERY` 支持 `dir` / `seq_from` / `seq_to` / `limit` / `cursor`；
-  `time_from/time_to` **不**承诺（无 NTP，`ts` 是 uptime），caps 只声明 `["seq","dir"]`。
+- `LOG_QUERY` 只查这个 RAM 窗口；`time_from/time_to` 不承诺（无 NTP）。
 
-> 为什么不做 SD：宿主目前还没接 `RemoteLogStore`，SD 的 `raw+index` + `LOG_EXPORT`
-> 是独立一块工作量。先把 RAM 日志做对，后续替换后端时保持 `bridge_port_log_*` 接口。
+### SD raw + index（权威）
+
+- SPI2 与 LCD 共用总线，CS=GPIO2；挂载 `/sdcard`，目录 `/sdcard/shb`。
+- 每次启动新建一组文件：`raw-rx/idx-rx/raw-tx/idx-tx-<seg>.bin`。
+- 索引 20 B/条：`offset(u64) + seq(u32) + tick(u32) + len(u16) + dir + pad`；
+  RX 按行、TX 按一次 write。
+- UART RX/TX 双写；默认 1 s `fsync`；按目录总大小保留（`BRIDGE_SD_RETAIN_MB`）。
+- `LOG_STATS` 读 SD 容量/已用/segment/raw/index/earliest/latest；
+  `LOG_EXPORT` 按 `dir/seq_from/cursor/max_bytes` 分页返回 raw + index。
+- 无卡 → `log_storage:"ram"`、`log_export:false`，行为回退到 RAM 窗口。
+
+实测（921600 摄像头、90 s 不读 TCP）：SD raw +472,149 B / +6,296 行，同时 RAM ring
+已满并累计丢弃 1.3 MB；导出的 frame no 连续。当前限制：只导出本次启动 segment、
+导出速度受 WiFi/视频上传影响、时间仍是 uptime。
 
 ## 8. 鉴权与并发
 
@@ -147,7 +160,7 @@ READ(from_offset = barrier)
 
 1. **PC 纯逻辑**（已跑）：`test/ring_test.c` 覆盖 append/copy 跨环、溢出丢旧、
    min/max/match/idle/budget、gap/clamp、transact 屏障。
-2. **固件构建**（已跑）：ESP-IDF v6.1 `fullclean && build`，0 warning，镜像约 845 KB。
+2. **固件构建**（已跑）：ESP-IDF v6.1 `fullclean && build`，0 warning，镜像约 1.3 MB。
    CMake 对 IDF 5.2+ 的 `esp_driver_uart/gpio` 拆分做条件 REQUIRES。
 3. **实机**：ESP-IDF v6.1 烧录启动；LCD `160x80 ST7789 ready`，二维码 66×66 px，
    BLE `PROV_00B160` 开始广播；App 配网成功后设备为 `<device-ip>`，
@@ -156,6 +169,8 @@ READ(from_offset = barrier)
    接摄像头后确认目标为 **921600 8N1**：8 s 抓 31,834 B、97% 可打印、0 个非法 UTF-8；
    `LOG_QUERY` 返回 `stcloud_init_camera ... frame no` / `ai detect` / `CPU Usage` 等行。
    1500000/2000000 为乱码。
+   SD：32 GB 卡 FAT 挂载成功；90 s 空闲窗口 SD 增长 472 KB / 6,296 行，期间 ring
+   已满并累计丢弃 1.3 MB；`LOG_EXPORT` 回读的 frame no 连续。
 4. **裸协议冒烟**（脚本已验证）：`tools/smoke.mjs`（纯 Node）对真实设备跑
    `HELLO/CONFIG/WRITE/READ/TRANSACT/LOG_STATS/CLOSE`；已用主机 fake bridge 跑通全流程。
 5. **主机 E2E**：`serial-hub-mcp` 的 `test/remote_tcp.unit.js` 用 fake bridge 验证同一
@@ -183,12 +198,13 @@ GOT_IP）、LCD 二维码/状态、以及断线重连（1 s 定时器）。配�
 安全边界：PoP 在二维码里，App 扫码获得；AP 侧无任何 HTTP 服务，只有 BLE。
 量产应使用逐台 PoP 或 Security2。
 
-## 13. 与协议文档的差异 / 待办## 13. 与协议文档的差异 / 待办
+## 13. 与协议文档的差异 / 待办
 
 | 项 | 现状 | 计划 |
 |---|---|---|
-| `LOG_EXPORT` | `not_impl` | SD `raw+index` 后端 |
-| `caps.log_storage` | `"ram"` | 有 SD 时 `"raw+index"` |
+| `LOG_EXPORT` | ✅ SD `raw+index`（本次启动 segment） | 跨重启 segment 列表 |
+| `caps.log_storage` | `"raw+index"`（有卡）/ `"ram"` | — |
+| SD 保留 | 4 GB / 目录总量 | 按天/容量轮转与导出 |
 | `time` | uptime tick，`synced:false` | SNTP 后给 epoch |
 | 多端口 | 仅 `uart0` | 端口表 + Kconfig |
 | `busy` | 不返回（串行处理） | 若未来 pipeline 再加 |

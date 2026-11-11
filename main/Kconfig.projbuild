@@ -60,6 +60,56 @@ menu "serial-hub-bridge"
 
     endmenu
 
+    menu "SD log (raw + index)"
+
+        config BRIDGE_SD_ENABLE
+            bool "Enable SD authoritative log"
+            default y
+            help
+                Mount the SD card (SPI2, shared with the LCD) and append raw
+                RX/TX bytes plus a fixed-size line index. RAM ring stays the
+                live READ window; SD is the durable history for LOG_EXPORT.
+                Without a card the firmware falls back to RAM-only.
+
+        config BRIDGE_SD_CS_GPIO
+            int "SD card CS GPIO"
+            default 2
+            depends on BRIDGE_SD_ENABLE
+            help
+                Alientek ESP32-S3 board SD slot on SPI2 (SCLK=12 MOSI=11
+                MISO=13, shared with the LCD, CS=2).
+
+        config BRIDGE_SD_MOUNT_POINT
+            string "SD mount point"
+            default "/sdcard"
+            depends on BRIDGE_SD_ENABLE
+
+        config BRIDGE_SD_FORMAT_IF_FAILED
+            bool "Format SD card when mount fails (DESTRUCTIVE)"
+            default n
+            depends on BRIDGE_SD_ENABLE
+            help
+                FATFS cannot mount exFAT or an unformatted card (FR_NO_FILESYSTEM).
+                Enabling this will erase and format the card as FAT on first boot.
+                Prefer formatting the card to FAT32 on a PC.
+
+        config BRIDGE_SD_RETAIN_MB
+            int "Retained SD log bytes (MB)"
+            default 4096
+            range 64 1048576
+            depends on BRIDGE_SD_ENABLE
+            help
+                Old segment files are removed once the log directory exceeds
+                this. 4096 MB holds ~11 days at 4 KB/s.
+
+        config BRIDGE_SD_SYNC_MS
+            int "SD fsync interval (ms)"
+            default 1000
+            range 100 60000
+            depends on BRIDGE_SD_ENABLE
+
+    endmenu
+
     menu "UART"
 
         config BRIDGE_UART_NUM

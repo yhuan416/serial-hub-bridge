@@ -29,14 +29,15 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 | `SET_LINES` | ✅（按接线） | RTS 走 UART，DTR 走普通 GPIO；未接线返回 `unsupported` |
 | `BREAK` | ✅（需实机确认） | `uart_write_bytes_with_break(size=0)` |
 | `PING` | ✅ | `t_ms` 回显 + `device_tick_ms` |
-| `LOG_STATS` | ✅ | ring 水位 + RAM 行日志统计 |
+| `LOG_STATS` | ✅ | ring 水位 + SD/RAM 日志统计 |
 | `LOG_QUERY` | ✅（RAM） | 按 `seq/dir` 过滤、`limit` 分页、`cursor` |
 | `LOG_CLEAR` | ✅ | 清 RAM 日志（`log_seq` 不回退） |
-| `LOG_EXPORT` | ✖ `not_impl` | 设备权威 SD 日志是下一步；`caps.log_export=false` |
+| `LOG_EXPORT` | ✅（需 SD） | SD `raw+index` 分块导出；无卡返回 `unsupported` |
 | `INFO` / `LIST_PORTS` / `CLOSE` | ✅ | |
 
-`caps`（HELLO 返回）当前为：`auth` 按 token、`has_sd:false`、`log_storage:"ram"`、
-`can_set_lines` 按接线、`can_break:true`、`can_config:true`、`binary_frames:false`。
+`caps`（HELLO 返回）：`auth` 按 token、`has_sd` 按卡、`log_storage` 为
+`"raw+index"`/`"ram"`、`log_export` 按卡、`can_set_lines` 按接线、`can_break:true`、
+`can_config:true`、`binary_frames:false`。
 
 ## 数据面语义（与主机一致）
 
@@ -57,8 +58,8 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 前置：ESP-IDF（**v6.1 已完整编译验证**；5.2+ 的驱动拆分已在 CMake 里做条件兼容），目标 `esp32s3`。
 
 ```bash
-# 1) 配置 UART 引脚 / 可选的首次 WiFi 种子（WiFi 也可以先不填，进 AP 配网页设置）
-idf.py menuconfig      # serial-hub-bridge -> Provisioning portal, UART
+# 1) 配置 UART / SD / BLE 配网参数
+idf.py menuconfig      # serial-hub-bridge -> Network/provisioning, SD log, UART
 
 # 2) 构建 + 烧录 + 监视
 idf.py set-target esp32s3
@@ -69,12 +70,11 @@ idf.py -p /dev/ttyACM0 flash monitor
 首次构建会通过组件管理器拉取 `espressif/cjson` 到 `managed_components/`（已 gitignore），
 需要能访问 components.espressif.com；离线环境可把该目录预置好。
 
-当前镜像约 **1.25 MB**（含 BLE/NimBLE + LVGL 无关的 LCD 驱动 + 二维码）。
-本机验证板是 16 MB flash + 8 MB PSRAM，构建时使用本地 `sdkconfig.board`
-（已 gitignore）启用 PSRAM、NimBLE 和 4 MB factory 分区：
+当前镜像约 **1.3 MB**（BLE/NimBLE + LCD/QR + FATFS/SD）。板级默认（16 MB flash、
+4 MB factory、8 MB PSRAM、NimBLE、LCD/SD 引脚）都已写进 `sdkconfig.defaults`，直接构建：
 
 ```bash
-SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board" idf.py build
+idf.py build
 ```
 
 启动日志会打印：
@@ -123,6 +123,30 @@ LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
 板子不同就改 `components/display/spilcd.h` 的引脚宏；LCD 初始化失败不影响 BLE 配网，
 二维码仍会打印在串口日志里。
 
+## SD 权威日志
+
+SD 卡与 LCD 共用 SPI2（CS=GPIO2），上电挂载到 `/sdcard`，日志目录 `/sdcard/shb`：
+
+- 每个方向独立文件：`raw-rx-<seg>.bin` / `idx-rx-<seg>.bin`，TX 同理
+- 索引 20 B/条：`offset(u64) + seq(u32) + tick(u32) + len(u16) + dir + pad`
+- UART RX/TX 双写；默认 1 s `fsync`；按总大小保留（`BRIDGE_SD_RETAIN_MB`，默认 4 GB）
+- `LOG_STATS` 返回 SD 容量/已用/segment/raw/index/earliest/latest
+- `LOG_EXPORT` 按 `dir/seq_from/cursor/max_bytes` 分页返回 raw + index；host 侧用
+  `tools/log_export.mjs` 还原文本
+- 卡不是 FAT（exFAT/空卡）时默认挂载失败回退 RAM；`BRIDGE_SD_FORMAT_IF_FAILED=y`
+  会**清空并格式化**卡
+
+实测（921600 摄像头日志、90 s 不读 TCP）：
+
+```
+SD  raw 519,600 -> 991,749   (+472,149 B / +6,296 行)
+RAM ring used=262,144 (满)   dropped=1,306,717
+```
+
+即 ring 已经覆盖不下，但 SD 完整保留了这 90 s；导出内容是可读的
+`[stcloud_init_camera] ... frame no` 文本。当前限制：只导出**本次启动的 segment**、
+导出速度受 WiFi/视频上传影响（约 2.5 s / 16 KB 页）、时间仍是 uptime（无 NTP）。
+
 ## 与主机联调
 
 主机侧（Node ≥ 18）：
@@ -170,6 +194,11 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 921600 --no-transact --token
 | `BRIDGE_MAX_HOLD_MS` | 10000 | 超过被 clamp 并回 `hold_clamped` |
 | `BRIDGE_LOG_ENTRIES` | 256 | 0 = 关闭 RAM 行日志 |
 | `BRIDGE_LOG_LINE_MAX` | 192 | 超长行截断（`bytes` 仍为全长） |
+| `BRIDGE_SD_ENABLE` | y | SD `raw+index` 权威日志 |
+| `BRIDGE_SD_CS_GPIO` | 2 | SPI2 与 LCD 共用 |
+| `BRIDGE_SD_FORMAT_IF_FAILED` | n | 挂载失败自动格式化（**清空卡**） |
+| `BRIDGE_SD_RETAIN_MB` | 4096 | 日志目录保留上限 |
+| `BRIDGE_SD_SYNC_MS` | 1000 | `fsync` 周期 |
 | `BRIDGE_PROV_POP` | `abcd1234` | BLE Security1 PoP，二维码里带 |
 | `BRIDGE_PROV_BLE_PREFIX` | `PROV_` | 最终 BLE 名 `<prefix>XXXXXX` |
 | `BRIDGE_LCD_ENABLE` | y | 160×80 ST7789 显示二维码/状态 |
@@ -190,7 +219,7 @@ node tools/smoke.mjs tcp://192.168.1.50:7000 --baud 921600 --no-transact --token
 # ring/read: all checks passed
 ```
 
-固件已用 **ESP-IDF v6.1** 做过 `fullclean && build`：0 warning，镜像约 **1.25 MB**
+固件已用 **ESP-IDF v6.1** 做过 `fullclean && build`：0 warning，镜像约 **1.3 MB**
 （4 MB factory 分区）。实机已验证：16 MB flash / 8 MB PSRAM、160×80 ST7789 LCD ready、
 二维码 66×66 px、BLE `PROV_00B160` 广播；App 配网成功后设备地址为 `<device-ip>`，主机跑
 
@@ -213,9 +242,14 @@ CPU Usage: 41%
 1500000 / 2000000 下是乱码。`TRANSACT` 需要目标能应答；当前摄像头是持续日志，
 用 `--no-transact`。host 侧 `open` 记得带 `baud_rate: 921600`（或存 profile）。
 
+SD 已实机验证：32 GB 卡格式化/FAT 挂载成功，`LOG_STATS` 显示 31 GB、`raw+index`；
+TX 的 `LOG_EXPORT` 精确回读；90 s 空闲窗口 SD 增长 472 KB / 6,296 行，同时 ring
+已满并累计丢弃 1.3 MB。详见上文“SD 权威日志”。
+
 ## 已知限制 / 下一步
 
-1. **设备权威 SD 日志**：`LOG_EXPORT` + `raw+index` 落盘（当前 `LOG_STORAGE=ram`）。
+1. **SD 跨重启导出**：当前只导出本次启动的 segment；旧 segment 仍在卡里，
+   但缺少协议级 segment 列表/导出。
 2. **时间**：无 NTP，`ts`/`time` 是 uptime（`source:"tick"`, `synced:false`）；
    接 SNTP 后可对齐 epoch。
 3. **多端口**：目前固定 `uart0`；契约已支持 `port_id`。
@@ -228,14 +262,16 @@ CPU Usage: 41%
    若你的 IDF 版本不生效，可改成 GPIO 拉低 TX 的方案。
 9. **配网安全**：当前 Security1 + 固定 PoP；量产建议逐台 PoP 或 Security2（SRP6a）。
    重新配网：长按 GPIO0 5 秒（清凭据 + 重启），或调 `bridge_prov_factory_reset()`。
-10. **LCD 引脚**：固定为正点原子 ESP32-S3 板；换板需改 `spilcd.h`。
+10. **LCD/SD 引脚**：固定为验证板（SPI2 + LCD CS39/SD CS2）；换板需改
+    `spilcd.h` 与 `BRIDGE_SD_CS_GPIO`。
+11. **LOG_QUERY vs SD**：`LOG_QUERY` 仍只查 RAM 窗口；历史统一走 `LOG_EXPORT`。
 
 ## 与 `feat/esp_idf` 的关系
 
 参考了其 `components/uart_port`（UART 驱动封装、line coding 映射）、
 `components/cdc_uart_bridge`（PSRAM ring、绝对游标思路）、`components/sdlog`（按时间
 切文件、flush 任务）。本工程刻意**不**引入 BSP / LVGL / USB CDC / App 框架，
-只保留 v0 需要的最小闭环，便于单独维护和烧到任意 S3 板。
+只保留最小 LCD/QR/SD 驱动，便于单独维护和烧到任意 S3 板。
 
 ## License
 
