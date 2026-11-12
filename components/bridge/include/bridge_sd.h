@@ -98,28 +98,28 @@ typedef struct {
     uint64_t next_cursor;
 } bridge_sd_export_t;
 
-esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t *port);
+esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t **ports, int port_count);
 bool bridge_sd_ready(void);
-uint32_t bridge_sd_latest_seq(void);
+uint32_t bridge_sd_latest_seq(int port);
 void bridge_sd_sync(void);
 
 /* Enqueue one atomic raw+index record for the SD writer task.
  * Called from the UART path; never performs FAT I/O and never blocks on SD.
  * raw_len == len + 1 means "append LF" (RX line); raw_len == len means exact.
  * Returns false when the PSRAM queue is full (counted as queue_dropped). */
-bool bridge_sd_submit(uint32_t seq, int64_t tick_ms, uint8_t dir,
+bool bridge_sd_submit(uint8_t port, uint32_t seq, int64_t tick_ms, uint8_t dir,
                       const uint8_t *data, uint16_t len, uint16_t raw_len);
 
-void bridge_sd_get_status(bridge_sd_status_t *out);
+void bridge_sd_get_status(int port, bridge_sd_status_t *out);
 
 /* Export one page. Caller frees `out` with bridge_sd_export_free(). */
-esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t *out);
+esp_err_t bridge_sd_export(int port, const bridge_sd_export_req_t *req, bridge_sd_export_t *out);
 void bridge_sd_export_free(bridge_sd_export_t *out);
 /* segment=NULL/empty clears all segments; returns whether the active segment was cleared. */
-esp_err_t bridge_sd_clear(const char *segment, bool *active_cleared);
+esp_err_t bridge_sd_clear(int port, const char *segment, bool *active_cleared);
 
 /* Persist host archive watermarks for retention; dir 0=rx, 1=tx. */
-esp_err_t bridge_sd_ack(const char *segment, uint8_t dir, uint32_t seq);
+esp_err_t bridge_sd_ack(int port, const char *segment, uint8_t dir, uint32_t seq);
 
 #ifdef __cplusplus
 }

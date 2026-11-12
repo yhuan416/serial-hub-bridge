@@ -51,6 +51,26 @@ static const char *jstr(const cJSON *o, const char *k)
     return cJSON_IsString(v) ? v->valuestring : NULL;
 }
 
+static int resolve_port(bridge_ctx_t *ctx, const cJSON *msg, bridge_port_t **out)
+{
+    const char *id = jstr(msg, "port");
+    if (!ctx || ctx->port_count <= 0) return -1;
+    int idx = 0;
+    if (id && id[0]) {
+        idx = -1;
+        for (int i = 0; i < ctx->port_count; i++) {
+            if (ctx->port_ids[i] && strcmp(id, ctx->port_ids[i]) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 && strcmp(id, "uart0") == 0) idx = 0; /* legacy alias */
+        if (idx < 0) return -1;
+    }
+    *out = ctx->ports[idx];
+    return *out ? idx : -1;
+}
+
 static bool jbool(const cJSON *o, const char *k, bool *out)
 {
     const cJSON *v = obj(o, k);
@@ -205,12 +225,6 @@ static char *make_err(const cJSON *id, const char *code, const char *message)
     return json_print(root);
 }
 
-static bool port_matches(const cJSON *msg)
-{
-    const char *pn = jstr(msg, "port");
-    return !pn || strcmp(pn, BRIDGE_PORT_ID) == 0;
-}
-
 /* ── op_id dedup ───────────────────────────────────────────────────────── */
 
 static void dedup_free(dedup_slot_t *s)
@@ -342,7 +356,6 @@ static cJSON *build_caps(bridge_ctx_t *ctx)
 
 static cJSON *build_info(bridge_ctx_t *ctx)
 {
-    const bridge_port_config_t *cfg = bridge_port_config(ctx->port);
     cJSON *res = cJSON_CreateObject();
     if (!res) {
         return NULL;
@@ -361,15 +374,20 @@ static cJSON *build_info(bridge_ctx_t *ctx)
     cJSON_AddItemToObject(res, "caps", caps);
 
     cJSON *ports = cJSON_AddArrayToObject(res, "ports");
-    cJSON *p = cJSON_CreateObject();
-    cJSON_AddStringToObject(p, "id", BRIDGE_PORT_ID);
-    cJSON_AddStringToObject(p, "kind", BRIDGE_PORT_KIND);
-    if (cfg) {
-        cJSON *pins = cJSON_AddObjectToObject(p, "pins");
-        cJSON_AddNumberToObject(pins, "tx", cfg->tx_pin);
-        cJSON_AddNumberToObject(pins, "rx", cfg->rx_pin);
+    for (int i = 0; i < ctx->port_count; i++) {
+        bridge_port_t *bp = ctx->ports[i];
+        if (!bp) continue;
+        const bridge_port_config_t *bc = bridge_port_config(bp);
+        cJSON *p = cJSON_CreateObject();
+        cJSON_AddStringToObject(p, "id", ctx->port_ids[i] ? ctx->port_ids[i] : "uart?");
+        cJSON_AddStringToObject(p, "kind", BRIDGE_PORT_KIND);
+        if (bc) {
+            cJSON *pins = cJSON_AddObjectToObject(p, "pins");
+            cJSON_AddNumberToObject(pins, "tx", bc->tx_pin);
+            cJSON_AddNumberToObject(pins, "rx", bc->rx_pin);
+        }
+        cJSON_AddItemToArray(ports, p);
     }
-    cJSON_AddItemToArray(ports, p);
 
     cJSON *time = cJSON_AddObjectToObject(res, "time");
     bool synced = bridge_time_synced();
@@ -741,7 +759,7 @@ static char *handle_log_stats(bridge_ctx_t *ctx, const cJSON *msg)
     bridge_port_stat(ctx->port, &st);
 
     bridge_sd_status_t sd;
-    bridge_sd_get_status(&sd);
+    bridge_sd_get_status(ctx->port_index, &sd);
     const bool use_sd = sd.mounted;
 
     uint32_t ram_first = 0;
@@ -909,7 +927,7 @@ static char *handle_log_query(bridge_ctx_t *ctx, const cJSON *msg)
     uint32_t last_seq = 0;
     bool have_last = false;
     bridge_sd_status_t sd;
-    bridge_sd_get_status(&sd);
+    bridge_sd_get_status(ctx->port_index, &sd);
 
     uint32_t total = bridge_port_log_count(ctx->port);
     for (uint32_t i = 0; i < total; i++) {
@@ -1136,7 +1154,7 @@ static char *handle_log_export(bridge_ctx_t *ctx, const cJSON *msg)
     }
 
     bridge_sd_export_t ex;
-    esp_err_t err = bridge_sd_export(&req, &ex);
+    esp_err_t err = bridge_sd_export(ctx->port_index, &req, &ex);
     if (err != ESP_OK) {
         return make_err(id, "io_error", esp_err_to_name(err));
     }
@@ -1196,7 +1214,7 @@ static char *handle_log_ack(bridge_ctx_t *ctx, const cJSON *msg)
     if (!bridge_sd_ready()) {
         return make_err(id, "unsupported", "no SD card");
     }
-    esp_err_t err = bridge_sd_ack(segment, strcmp(dir, "tx") == 0 ? 1 : 0, seq);
+    esp_err_t err = bridge_sd_ack(ctx->port_index, segment, strcmp(dir, "tx") == 0 ? 1 : 0, seq);
     if (err != ESP_OK) {
         return make_err(id, err == ESP_ERR_INVALID_ARG ? "bad_request" : "io_error",
                         esp_err_to_name(err));
@@ -1220,7 +1238,7 @@ static char *handle_log_clear(bridge_ctx_t *ctx, const cJSON *msg)
     bool active_cleared = false;
     bool sd_cleared = false;
     if (bridge_sd_ready()) {
-        esp_err_t err = bridge_sd_clear(segment, &active_cleared);
+        esp_err_t err = bridge_sd_clear(ctx->port_index, segment, &active_cleared);
         if (err != ESP_OK) {
             return make_err(id, err == ESP_ERR_INVALID_ARG ? "bad_request" : "io_error",
                             esp_err_to_name(err));
@@ -1331,18 +1349,24 @@ char *bridge_proto_handle(bridge_ctx_t *ctx,
     if (strcmp(op, "LIST_PORTS") == 0) {
         cJSON *r = cJSON_CreateObject();
         cJSON *ports = cJSON_AddArrayToObject(r, "ports");
-        cJSON *p = cJSON_CreateObject();
-        cJSON_AddStringToObject(p, "id", BRIDGE_PORT_ID);
-        cJSON_AddStringToObject(p, "kind", BRIDGE_PORT_KIND);
-        cJSON_AddItemToArray(ports, p);
+        for (int i = 0; i < ctx->port_count; i++) {
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddStringToObject(p, "id", ctx->port_ids[i] ? ctx->port_ids[i] : "uart?");
+            cJSON_AddStringToObject(p, "kind", BRIDGE_PORT_KIND);
+            cJSON_AddItemToArray(ports, p);
+        }
         out = make_ok(id, r);
         goto done;
     }
 
-    if (!port_matches(msg)) {
-        out = make_err(id, "port_not_found", "unknown port (this bridge exposes uart0)");
+    bridge_port_t *req_port = NULL;
+    int req_idx = resolve_port(ctx, msg, &req_port);
+    if (req_idx < 0 || !req_port) {
+        out = make_err(id, "port_not_found", "unknown port");
         goto done;
     }
+    ctx->port = req_port;
+    ctx->port_index = req_idx;
 
     if (strcmp(op, "CONFIG") == 0) {
         out = handle_config(ctx, msg);
@@ -1368,7 +1392,7 @@ char *bridge_proto_handle(bridge_ctx_t *ctx,
         out = handle_log_export(ctx, msg);
     } else if (strcmp(op, "CLOSE") == 0) {
         cJSON *r = cJSON_CreateObject();
-        cJSON_AddStringToObject(r, "port", BRIDGE_PORT_ID);
+        cJSON_AddStringToObject(r, "port", ctx->port_ids[ctx->port_index]);
         cJSON_AddBoolToObject(r, "closed", true);
         out = make_ok(id, r);
         if (close_after) {

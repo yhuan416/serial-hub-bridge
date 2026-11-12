@@ -110,6 +110,27 @@ done:
     free(line);
 }
 
+typedef struct {
+    bridge_ctx_t ctx;
+    int fd;
+} session_arg_t;
+
+static void session_task(void *arg)
+{
+    session_arg_t *a = (session_arg_t *)arg;
+    if (!a) {
+        vTaskDelete(NULL);
+        return;
+    }
+    session_run(&a->ctx, a->fd);
+    shutdown(a->fd, SHUT_RDWR);
+    close(a->fd);
+    if (a->ctx.scratch) free(a->ctx.scratch);
+    free(a);
+    ESP_LOGI(TAG, "client session ended");
+    vTaskDelete(NULL);
+}
+
 static void serve_forever(bridge_ctx_t *ctx, uint16_t port)
 {
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -132,7 +153,7 @@ static void serve_forever(bridge_ctx_t *ctx, uint16_t port)
         close(srv);
         return;
     }
-    if (listen(srv, 1) != 0) {
+    if (listen(srv, 4) != 0) {
         ESP_LOGE(TAG, "listen() failed: errno=%d", errno);
         close(srv);
         return;
@@ -155,10 +176,28 @@ static void serve_forever(bridge_ctx_t *ctx, uint16_t port)
 
         ESP_LOGI(TAG, "client %s:%u connected", inet_ntoa(peer.sin_addr),
                  (unsigned)ntohs(peer.sin_port));
-        session_run(ctx, fd);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
-        ESP_LOGI(TAG, "client disconnected");
+        session_arg_t *a = (session_arg_t *)calloc(1, sizeof(*a));
+        if (!a) {
+            close(fd);
+            continue;
+        }
+        a->ctx = *ctx;
+        a->ctx.port = ctx->ports[0];
+        a->ctx.port_index = 0;
+        a->ctx.scratch = (uint8_t *)malloc(a->ctx.scratch_cap ? a->ctx.scratch_cap : 32768);
+        if (!a->ctx.scratch) {
+            free(a);
+            close(fd);
+            continue;
+        }
+        a->ctx.scratch_cap = a->ctx.scratch_cap ? a->ctx.scratch_cap : 32768;
+        a->fd = fd;
+        if (xTaskCreate(session_task, "tcp_sess", 8192, a, 8, NULL) != pdPASS) {
+            free(a->ctx.scratch);
+            free(a);
+            close(fd);
+            continue;
+        }
     }
 }
 

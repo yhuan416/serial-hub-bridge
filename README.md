@@ -37,6 +37,11 @@ ESP32-S3 无线串口桥（**设备侧 v0**），对接
 | `EVENT_QUERY` | ✅ | 控制面事件：SD 挂载/重挂载/写失败、ring drop |
 | `INFO` / `LIST_PORTS` / `CLOSE` | ✅ | |
 
+`caps.ports` 返回 `uart1`(UART1 17/18) 和 `uart2`(UART2 4/5)；host
+`open({transport:"remote", port_id:"uart2"})` 选择第二路。每路独立 ring/RAM/SD
+目录 `shb/p0`/`shb/p1`；共享一个 SD 写队列。`BRIDGE_PORT_COUNT=2` 时 ring 总量按
+`BRIDGE_RING_BYTES / 2` 分配。
+
 `caps`（HELLO 返回）：`auth` 按 token、`has_sd` 按卡、`log_storage` 为
 `"raw+index"`/`"ram"`、`log_export` 按卡、`events:true`、`can_set_lines` 按接线、`can_break:true`、
 `can_config:true`、`binary_frames:false`。
@@ -110,8 +115,10 @@ I (1235) bridge_net: listening on tcp://0.0.0.0:7000 (proto v0)
 | 信号 | 默认 | 说明 |
 |---|---|---|
 | UART | 1 | 避免占用 UART0 console |
-| TX | GPIO17 | |
-| RX | GPIO18 | 上拉 |
+| TX | GPIO17 | UART1，Port A |
+| RX | GPIO18 | UART1，Port A |
+| UART2 TX | **GPIO4** | Port B，新增 |
+| UART2 RX | **GPIO5** | Port B，新增 |
 | RTS | 未接 | 接 EN 可做复位（`SET_LINES rts`，低有效） |
 | CTS | 未接 | `flow_control=rtscts` 时必需 |
 | DTR | 未接 | 接 GPIO0 可做下载模式（低有效） |

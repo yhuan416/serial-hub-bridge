@@ -45,7 +45,7 @@
 #define EXPORT_CHUNK_MAX 32768
 #define EXPORT_LINES_MAX 512
 #define RETENTION_EVERY 60
-#define SD_Q_HDR 16
+#define SD_Q_HDR 20
 
 typedef struct __attribute__((packed)) {
     uint32_t seq;
@@ -53,9 +53,47 @@ typedef struct __attribute__((packed)) {
     uint16_t len;
     uint16_t raw_len;
     uint8_t dir;
-    uint8_t flags;
-    uint16_t reserved;
+    uint8_t port;
+    uint16_t flags;
+    uint32_t generation;
 } sd_q_hdr_t;
+
+typedef struct {
+    char id[32];
+    char path[4][192];
+    FILE *raw[2];
+    FILE *idx[2];
+    uint64_t raw_bytes[2];
+    uint32_t idx_count[2];
+    uint32_t first_seq;
+    uint32_t last_seq;
+    bridge_port_t *port;
+    uint32_t resume_seq;
+    uint32_t seg_boot_id;
+    int64_t time_base;
+    bool time_synced;
+    bool initial_mount;
+    uint32_t generation;
+} sd_log_t;
+
+static sd_log_t s_logs[BRIDGE_MAX_PORTS];
+static int s_cur_port;
+static int s_port_count = 1;
+#define s_id (s_logs[s_cur_port].id)
+#define s_path (s_logs[s_cur_port].path)
+#define s_raw (s_logs[s_cur_port].raw)
+#define s_idx (s_logs[s_cur_port].idx)
+#define s_raw_bytes (s_logs[s_cur_port].raw_bytes)
+#define s_idx_count (s_logs[s_cur_port].idx_count)
+#define s_first_seq (s_logs[s_cur_port].first_seq)
+#define s_last_seq (s_logs[s_cur_port].last_seq)
+#define s_port (s_logs[s_cur_port].port)
+#define s_resume_seq (s_logs[s_cur_port].resume_seq)
+#define s_seg_boot_id (s_logs[s_cur_port].seg_boot_id)
+#define s_time_base (s_logs[s_cur_port].time_base)
+#define s_time_synced (s_logs[s_cur_port].time_synced)
+#define s_initial_mount (s_logs[s_cur_port].initial_mount)
+#define s_generation (s_logs[s_cur_port].generation)
 
 static SemaphoreHandle_t s_lock;
 static sdmmc_card_t *s_card;
@@ -70,22 +108,8 @@ static uint32_t s_write_errors;
 static uint32_t s_mount_fail_count;
 static uint32_t s_last_write_event_ms;
 
-static char s_id[32];
-static char s_path[4][96]; /* raw_rx, idx_rx, raw_tx, idx_tx */
-static FILE *s_raw[2];
-static FILE *s_idx[2];
-static uint64_t s_raw_bytes[2];
-static uint32_t s_idx_count[2];
-static uint32_t s_first_seq;
-static uint32_t s_last_seq;
 static uint32_t s_sync_ticks;
-static bridge_port_t *s_port;
-static uint32_t s_resume_seq;
 static uint32_t s_boot_id;
-static uint32_t s_seg_boot_id;
-static int64_t s_time_base;
-static bool s_time_synced;
-static bool s_initial_mount = true;
 
 static uint8_t *s_qbuf;
 static size_t s_qcap;
@@ -103,7 +127,8 @@ static esp_err_t sd_try_mount(int attempts);
 static void sd_remount(void);
 static void sd_writer_task(void *arg);
 static bool sd_seg_id_ok(const char *id);
-static void sd_paths_for(const char *id, char paths[4][96]);
+static void sd_paths_for(const char *id, char paths[4][192]);
+static void sd_port_dir(char *out, size_t cap);
 static void sd_index_bounds_path(const char *path, uint32_t *count,
                                  uint32_t *first, uint32_t *last);
 static bool sd_q_idle(void);
@@ -169,7 +194,9 @@ typedef struct __attribute__((packed)) {
 
 static void sd_time_path(const char *id, char *out, size_t cap)
 {
-    snprintf(out, cap, "%s/time-%s.bin", SD_DIR, id);
+    char dir[96];
+    sd_port_dir(dir, sizeof(dir));
+    snprintf(out, cap, "%s/time-%.63s.bin", dir, id);
 }
 
 static bool sd_read_time_path(const char *id, int64_t *base, bool *synced, uint32_t *boot_id)
@@ -216,7 +243,9 @@ typedef struct __attribute__((packed)) {
 
 static void sd_ack_path(const char *id, char *out, size_t cap)
 {
-    snprintf(out, cap, "%s/ack-%s.bin", SD_DIR, id);
+    char dir[96];
+    sd_port_dir(dir, sizeof(dir));
+    snprintf(out, cap, "%s/ack-%.63s.bin", dir, id);
 }
 
 static bool sd_read_ack_path(const char *id, uint32_t *rx, uint32_t *tx)
@@ -265,7 +294,9 @@ static void sd_retention_locked(void)
     const int max_segs = 64;
     seg_ent_t *segs = (seg_ent_t *)calloc(max_segs, sizeof(seg_ent_t));
     if (!segs) return;
-    DIR *d = opendir(SD_DIR);
+    char pdir[96];
+    sd_port_dir(pdir, sizeof(pdir));
+    DIR *d = opendir(pdir);
     if (!d) {
         free(segs);
         return;
@@ -310,7 +341,7 @@ static void sd_retention_locked(void)
             sd_read_ack_path(id, &segs[idx].acked_rx, &segs[idx].acked_tx);
         }
         char full[320];
-        snprintf(full, sizeof(full), "%s/%s", SD_DIR, name);
+        snprintf(full, sizeof(full), "%s/%.200s", pdir, name);
         struct stat st;
         if (stat(full, &st) == 0) {
             segs[idx].size += (uint64_t)st.st_size;
@@ -345,7 +376,7 @@ static void sd_retention_locked(void)
             if (oldest < 0 || segs[i].mtime < segs[oldest].mtime) oldest = i;
         }
         if (oldest < 0) break;
-        char paths[4][96];
+        char paths[4][192];
         sd_paths_for(segs[oldest].id, paths);
         for (int k = 0; k < 4; k++) unlink(paths[k]);
         char ack[160];
@@ -373,7 +404,7 @@ static void sd_retention_locked(void)
                 if (oldest < 0 || segs[i].mtime < segs[oldest].mtime) oldest = i;
             }
             if (oldest < 0) break;
-            char paths[4][96];
+            char paths[4][192];
             sd_paths_for(segs[oldest].id, paths);
             for (int k = 0; k < 4; k++) unlink(paths[k]);
             char ack[160];
@@ -407,12 +438,19 @@ static bool sd_seg_id_ok(const char *id)
     return true;
 }
 
-static void sd_paths_for(const char *id, char paths[4][96])
+static void sd_port_dir(char *out, size_t cap)
 {
-    snprintf(paths[0], 96, "%s/raw-rx-%s.bin", SD_DIR, id);
-    snprintf(paths[1], 96, "%s/idx-rx-%s.bin", SD_DIR, id);
-    snprintf(paths[2], 96, "%s/raw-tx-%s.bin", SD_DIR, id);
-    snprintf(paths[3], 96, "%s/idx-tx-%s.bin", SD_DIR, id);
+    snprintf(out, cap, "%s/p%d", SD_DIR, s_cur_port);
+}
+
+static void sd_paths_for(const char *id, char paths[4][192])
+{
+    char dir[96];
+    sd_port_dir(dir, sizeof(dir));
+    snprintf(paths[0], sizeof(paths[0]), "%s/raw-rx-%.63s.bin", dir, id);
+    snprintf(paths[1], sizeof(paths[1]), "%s/idx-rx-%.63s.bin", dir, id);
+    snprintf(paths[2], sizeof(paths[2]), "%s/raw-tx-%.63s.bin", dir, id);
+    snprintf(paths[3], sizeof(paths[3]), "%s/idx-tx-%.63s.bin", dir, id);
 }
 
 static bool sd_stat_size_mtime(const char *path, uint64_t *size, int64_t *mtime)
@@ -489,7 +527,9 @@ static int sd_scan_segments_locked(sd_scan_seg_t *out, int max, uint32_t *global
     if (global_latest) {
         *global_latest = 0;
     }
-    DIR *d = opendir(SD_DIR);
+    char pdir[96];
+    sd_port_dir(pdir, sizeof(pdir));
+    DIR *d = opendir(pdir);
     if (!d) {
         return 0;
     }
@@ -514,7 +554,7 @@ static int sd_scan_segments_locked(sd_scan_seg_t *out, int max, uint32_t *global
         if (!sd_seg_id_ok(id)) {
             continue;
         }
-        char paths[4][96];
+        char paths[4][192];
         sd_paths_for(id, paths);
         uint64_t sizes[4] = {0};
         int64_t mtimes[4] = {0};
@@ -581,7 +621,7 @@ static int sd_scan_segments_locked(sd_scan_seg_t *out, int max, uint32_t *global
 
 static void sd_repair_dir_locked(const char *id, int dir)
 {
-    char paths[4][96];
+    char paths[4][192];
     sd_paths_for(id, paths);
     const char *raw_path = paths[dir * 2];
     const char *idx_path = paths[1 + dir * 2];
@@ -665,7 +705,7 @@ static void sd_repair_dir_locked(const char *id, int dir)
 
 static bool sd_open_existing_locked(const char *id)
 {
-    char paths[4][96];
+    char paths[4][192];
     sd_paths_for(id, paths);
     uint64_t raw_sizes[2] = {0};
     int64_t mt = 0;
@@ -875,25 +915,41 @@ static esp_err_t sd_try_mount(int attempts)
     if (mkdir(SD_DIR, 0777) != 0) {
         /* EEXIST is fine */
     }
+    for (int i = 0; i < s_port_count; i++) {
+        char pdir[96];
+        snprintf(pdir, sizeof(pdir), "%s/p%d", SD_DIR, i);
+        if (mkdir(pdir, 0777) != 0) {
+            /* EEXIST is fine */
+        }
+    }
 
     sd_lock();
     if (s_mounted) {
         sd_unlock();
         return ESP_OK;
     }
-    sd_retention_locked();
-    err = sd_resume_or_create_locked(s_initial_mount && CONFIG_BRIDGE_NTP_ENABLE);
+    for (int i = 0; i < s_port_count; i++) {
+        s_cur_port = i;
+        sd_retention_locked();
+        err = sd_resume_or_create_locked(s_initial_mount && CONFIG_BRIDGE_NTP_ENABLE);
+        if (err == ESP_OK) {
+            s_initial_mount = false;
+        } else {
+            break;
+        }
+    }
     if (err == ESP_OK) {
         s_mounted = true;
-        s_initial_mount = false;
         s_broken = false;
         s_mount_fail_count = 0;
     }
     sd_unlock();
 
-    if (s_resume_seq && s_port) {
-        bridge_port_log_set_seq(s_port, s_resume_seq);
-        s_resume_seq = 0;
+    for (int i = 0; i < s_port_count; i++) {
+        if (s_logs[i].resume_seq && s_logs[i].port) {
+            bridge_port_log_set_seq(s_logs[i].port, s_logs[i].resume_seq);
+            s_logs[i].resume_seq = 0;
+        }
     }
 
     if (err != ESP_OK) {
@@ -906,12 +962,13 @@ static esp_err_t sd_try_mount(int attempts)
 
     uint64_t total = 0, freeb = 0;
     esp_vfs_fat_info(CONFIG_BRIDGE_SD_MOUNT_POINT, &total, &freeb);
-    ESP_LOGI(TAG, "mounted at %s, %.1f/%.1f MiB free, dir=%s, seg=%s",
-             CONFIG_BRIDGE_SD_MOUNT_POINT, (double)freeb / 1048576.0,
-             (double)total / 1048576.0, SD_DIR, s_id);
-    bridge_event_push(BRIDGE_EVENT_INFO, "sd.mount",
-                      "mounted seg=%s free=%.1f/%.1f MiB", s_id,
-                      (double)freeb / 1048576.0, (double)total / 1048576.0);
+    for (int i = 0; i < s_port_count; i++) {
+        s_cur_port = i;
+        ESP_LOGI(TAG, "mounted %s seg=%s", s_logs[i].port ? "port" : "?", s_id);
+        bridge_event_push(BRIDGE_EVENT_INFO, "sd.mount",
+                          "mounted p%d seg=%s free=%.1f/%.1f MiB", i, s_id,
+                          (double)freeb / 1048576.0, (double)total / 1048576.0);
+    }
     return ESP_OK;
 #endif
 }
@@ -923,7 +980,10 @@ static void sd_remount(void)
         sd_unlock();
         return;
     }
-    sd_close_segment_locked();
+    for (int i = 0; i < s_port_count; i++) {
+        s_cur_port = i;
+        sd_close_segment_locked();
+    }
     sdmmc_card_t *card = s_card;
     s_card = NULL;
     s_mounted = false;
@@ -967,35 +1027,50 @@ static void sd_sync_timer(void *arg)
         return;
     }
     sd_lock();
-    for (int i = 0; i < 2; i++) {
-        sd_fsync(s_raw[i]);
-        sd_fsync(s_idx[i]);
-    }
-    if (s_port) {
-        bridge_port_log_flush_partial(s_port);
-    }
-    if (!s_time_base && bridge_time_synced() && sd_q_idle()) {
-        /* A segment that started before NTP has an unknown tick->epoch base.
-         * Seal it and start a fresh, time-anchored segment. */
-        if (sd_rotate_locked() == ESP_OK) {
-            bridge_event_push(BRIDGE_EVENT_INFO, "time.rotate",
-                              "NTP synced; new time-anchored segment %s", s_id);
+    for (int pidx = 0; pidx < s_port_count; pidx++) {
+        s_cur_port = pidx;
+        for (int i = 0; i < 2; i++) {
+            sd_fsync(s_raw[i]);
+            sd_fsync(s_idx[i]);
+        }
+        if (s_port) {
+            bridge_port_log_flush_partial(s_port);
+        }
+        if (!s_time_base && bridge_time_synced() && sd_q_idle()) {
+            /* A segment that started before NTP has an unknown tick->epoch base.
+             * Seal it and start a fresh, time-anchored segment. */
+            if (sd_rotate_locked() == ESP_OK) {
+                bridge_event_push(BRIDGE_EVENT_INFO, "time.rotate",
+                                  "NTP synced; new time-anchored segment %s", s_id);
+            }
+        }
+        if ((s_sync_ticks + 1) % RETENTION_EVERY == 0) {
+            sd_retention_locked();
         }
     }
-    if (++s_sync_ticks % RETENTION_EVERY == 0) {
-        sd_retention_locked();
-    }
+    s_sync_ticks++;
     sd_unlock();
 }
 
-esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t *port)
+esp_err_t bridge_sd_init(bool spi_bus_ready, bridge_port_t **ports, int port_count)
 {
 #if !CONFIG_BRIDGE_SD_ENABLE
-    (void)port;
+    (void)ports;
+    (void)port_count;
     ESP_LOGI(TAG, "disabled by Kconfig");
     return ESP_ERR_NOT_SUPPORTED;
 #else
-    s_port = port;
+    if (!ports || port_count <= 0) return ESP_ERR_INVALID_ARG;
+    s_port_count = port_count > BRIDGE_MAX_PORTS ? BRIDGE_MAX_PORTS : port_count;
+    for (int i = 0; i < BRIDGE_MAX_PORTS; i++) {
+        s_logs[i].port = i < s_port_count ? ports[i] : NULL;
+        s_logs[i].initial_mount = true;
+        s_logs[i].generation = 1;
+        s_logs[i].time_base = 0;
+        s_logs[i].time_synced = false;
+        s_logs[i].seg_boot_id = 0;
+        s_logs[i].resume_seq = 0;
+    }
     if (s_enabled) {
         return s_mounted ? ESP_OK : ESP_FAIL;
     }
@@ -1184,10 +1259,10 @@ static void sd_q_note_drop(size_t len)
     }
 }
 
-bool bridge_sd_submit(uint32_t seq, int64_t tick_ms, uint8_t dir,
+bool bridge_sd_submit(uint8_t port, uint32_t seq, int64_t tick_ms, uint8_t dir,
                       const uint8_t *data, uint16_t len, uint16_t raw_len)
 {
-    if (!s_qbuf || !s_qlock || !s_qcap || !data || dir > 1 ||
+    if (!s_qbuf || !s_qlock || !s_qcap || !data || port >= s_port_count || dir > 1 ||
         len > CONFIG_BRIDGE_MAX_FRAME || raw_len < len || raw_len > (uint16_t)(len + 1) ||
         (len == 0 && raw_len == 0)) {
         return false;
@@ -1205,8 +1280,9 @@ bool bridge_sd_submit(uint32_t seq, int64_t tick_ms, uint8_t dir,
         .len = len,
         .raw_len = raw_len,
         .dir = dir,
+        .port = port,
         .flags = 0,
-        .reserved = 0,
+        .generation = s_logs[port].generation,
     };
     sd_q_write((const uint8_t *)&h, sizeof(h));
     sd_q_write(data, len);
@@ -1245,6 +1321,11 @@ static void sd_writer_task(void *arg)
             else vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+        if (h.port >= s_port_count || h.generation != s_logs[h.port].generation) {
+            sd_unlock();
+            continue; /* cleared port: discard stale queue records */
+        }
+        s_cur_port = h.port;
         const int dir = h.dir;
         uint64_t off = s_raw_bytes[dir];
         bool ok = fwrite(buf, 1, h.len, s_raw[dir]) == h.len;
@@ -1281,7 +1362,7 @@ static void sd_writer_task(void *arg)
     }
 }
 
-void bridge_sd_get_status(bridge_sd_status_t *out)
+void bridge_sd_get_status(int port, bridge_sd_status_t *out)
 {
     if (!out) {
         return;
@@ -1300,6 +1381,11 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
         return;
     }
     sd_lock();
+    if (port < 0 || port >= s_port_count) {
+        sd_unlock();
+        return;
+    }
+    s_cur_port = port;
     uint64_t total = 0, freeb = 0;
     if (esp_vfs_fat_info(CONFIG_BRIDGE_SD_MOUNT_POINT, &total, &freeb) == ESP_OK) {
         out->capacity_bytes = total;
@@ -1353,12 +1439,13 @@ void bridge_sd_get_status(bridge_sd_status_t *out)
     sd_unlock();
 }
 
-uint32_t bridge_sd_latest_seq(void)
+uint32_t bridge_sd_latest_seq(int port)
 {
-    if (!s_mounted) {
+    if (!s_mounted || port < 0 || port >= s_port_count) {
         return 0;
     }
     sd_lock();
+    s_cur_port = port;
     sd_scan_seg_t segs[BRIDGE_SD_MAX_SEGMENTS];
     uint32_t global_latest = 0;
     sd_scan_segments_locked(segs, BRIDGE_SD_MAX_SEGMENTS, &global_latest);
@@ -1371,7 +1458,7 @@ uint32_t bridge_sd_latest_seq(void)
 
 static void sd_unlink_segment_locked(const char *id)
 {
-    char paths[4][96];
+    char paths[4][192];
     sd_paths_for(id, paths);
     for (int i = 0; i < 4; i++) {
         unlink(paths[i]);
@@ -1386,7 +1473,9 @@ static void sd_unlink_segment_locked(const char *id)
 
 static void sd_unlink_all_locked(void)
 {
-    DIR *d = opendir(SD_DIR);
+    char pdir[96];
+    sd_port_dir(pdir, sizeof(pdir));
+    DIR *d = opendir(pdir);
     if (!d) {
         return;
     }
@@ -1399,21 +1488,23 @@ static void sd_unlink_all_locked(void)
             continue;
         }
         char full[320];
-        snprintf(full, sizeof(full), "%s/%s", SD_DIR, name);
+        snprintf(full, sizeof(full), "%s/%.200s", pdir, name);
         unlink(full);
     }
     closedir(d);
 }
 
-esp_err_t bridge_sd_ack(const char *segment, uint8_t dir, uint32_t seq)
+esp_err_t bridge_sd_ack(int port, const char *segment, uint8_t dir, uint32_t seq)
 {
-    if (!segment || !segment[0] || dir > 1 || !sd_seg_id_ok(segment)) {
+    if (!segment || !segment[0] || dir > 1 || !sd_seg_id_ok(segment) ||
+        port < 0 || port >= s_port_count) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_mounted) {
         return ESP_ERR_INVALID_STATE;
     }
     sd_lock();
+    s_cur_port = port;
     uint32_t rx = 0, tx = 0;
     sd_read_ack_path(segment, &rx, &tx);
     if (dir == 0) {
@@ -1426,18 +1517,20 @@ esp_err_t bridge_sd_ack(const char *segment, uint8_t dir, uint32_t seq)
     return ok ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t bridge_sd_clear(const char *segment, bool *active_cleared)
+esp_err_t bridge_sd_clear(int port, const char *segment, bool *active_cleared)
 {
     if (active_cleared) {
         *active_cleared = false;
     }
-    if (!s_mounted) {
+    if (!s_mounted || port < 0 || port >= s_port_count) {
         return ESP_ERR_INVALID_STATE;
     }
     if (segment && segment[0] && !sd_seg_id_ok(segment)) {
         return ESP_ERR_INVALID_ARG;
     }
     sd_lock();
+    s_cur_port = port;
+    s_generation++;
     esp_err_t err = ESP_OK;
     if (segment && segment[0]) {
         if (strcmp(segment, s_id) == 0) {
@@ -1517,9 +1610,9 @@ static void sd_time_for_segment_locked(const char *id, int64_t *base, bool *sync
     }
 }
 
-esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t *out)
+esp_err_t bridge_sd_export(int port, const bridge_sd_export_req_t *req, bridge_sd_export_t *out)
 {
-    if (!req || !out) {
+    if (!req || !out || port < 0 || port >= s_port_count) {
         return ESP_ERR_INVALID_ARG;
     }
     memset(out, 0, sizeof(*out));
@@ -1533,7 +1626,7 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
     if (!sd_seg_id_ok(seg)) {
         return ESP_ERR_INVALID_ARG;
     }
-    char paths[4][96];
+    char paths[4][192];
     sd_paths_for(seg, paths);
 
     uint32_t max_bytes = req->max_bytes ? req->max_bytes : EXPORT_CHUNK_MAX;
@@ -1546,6 +1639,7 @@ esp_err_t bridge_sd_export(const bridge_sd_export_req_t *req, bridge_sd_export_t
 
     const int dir = req->dir;
     sd_lock();
+    s_cur_port = port;
     if (strcmp(seg, s_id) == 0) {
         sd_fsync(s_raw[dir]);
         sd_fsync(s_idx[dir]);

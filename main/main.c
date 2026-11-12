@@ -55,19 +55,41 @@ void app_main(void)
         ESP_LOGW(TAG, "LCD init failed; QR only in the serial log");
     }
 #endif
-    bridge_port_t *port = bridge_port_init(&pc);
-    if (!port) {
-        ESP_LOGE(TAG, "failed to init UART bridge port");
+    const int port_count = CONFIG_BRIDGE_PORT_COUNT;
+    bridge_port_t *ports[BRIDGE_MAX_PORTS] = {0};
+    pc.ring_bytes = CONFIG_BRIDGE_RING_BYTES / (port_count > 0 ? port_count : 1);
+    pc.sd_port = 0;
+    ports[0] = bridge_port_init(&pc);
+    if (!ports[0]) {
+        ESP_LOGE(TAG, "failed to init UART bridge port 0");
         return;
     }
+    if (port_count > 1) {
+        bridge_port_config_t pc1 = pc;
+        pc1.uart_num = (uart_port_t)CONFIG_BRIDGE_UART2_NUM;
+        pc1.tx_pin = CONFIG_BRIDGE_UART2_TX_GPIO;
+        pc1.rx_pin = CONFIG_BRIDGE_UART2_RX_GPIO;
+        pc1.baud_rate = CONFIG_BRIDGE_UART2_BAUD;
+        pc1.sd_port = 1;
+        ports[1] = bridge_port_init(&pc1);
+        if (!ports[1]) {
+            ESP_LOGW(TAG, "UART2 bridge port init failed; continuing single-port");
+        }
+    }
 
-    if (bridge_sd_init(bridge_display_ready(), port) != ESP_OK) {
+    const int actual_ports = ports[1] ? 2 : 1;
+    if (bridge_sd_init(bridge_display_ready(), ports, actual_ports) != ESP_OK) {
         ESP_LOGW(TAG, "SD log unavailable; RAM-only mode");
     }
 
     static bridge_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.port = port;
+    ctx.port_count = actual_ports;
+    ctx.ports[0] = ports[0];
+    ctx.ports[1] = ports[1];
+    ctx.port_ids[0] = "uart1";
+    ctx.port_ids[1] = "uart2";
+    ctx.port = ports[0];
     ctx.token = CONFIG_BRIDGE_AUTH_TOKEN[0] ? CONFIG_BRIDGE_AUTH_TOKEN : NULL;
     ctx.max_frame = CONFIG_BRIDGE_MAX_FRAME;
     ctx.max_hold_ms = CONFIG_BRIDGE_MAX_HOLD_MS;

@@ -21,9 +21,14 @@ extern "C" {
 #define BRIDGE_FW_VERSION "0.1.0"
 #define BRIDGE_PORT_ID "uart0"
 #define BRIDGE_PORT_KIND "uart"
+#define BRIDGE_MAX_PORTS 2
 
 typedef struct bridge_ctx {
-    bridge_port_t *port;
+    bridge_port_t *ports[BRIDGE_MAX_PORTS];
+    const char *port_ids[BRIDGE_MAX_PORTS];
+    int port_count;
+    int port_index;
+    bridge_port_t *port; /* current/default = ports[0] */
 
     /* NULL or empty => HELLO token auth disabled (caps.auth=false). */
     const char *token;

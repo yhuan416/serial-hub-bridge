@@ -178,7 +178,7 @@ static void log_rx_locked(bridge_port_t *p, uint64_t base_abs, const uint8_t *da
             uint32_t raw_len = (uint32_t)((base_abs + i + 1) - line_off);
             uint32_t seq = log_push_locked(p, 0, line_off,
                                            (const uint8_t *)p->partial, n);
-            bridge_sd_submit(seq, (int64_t)bridge_now_ms(), 0,
+            bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 0,
                              (const uint8_t *)p->partial,
                              (uint16_t)p->partial_len, (uint16_t)raw_len);
             p->partial_len = 0;
@@ -192,7 +192,7 @@ static void log_rx_locked(bridge_port_t *p, uint64_t base_abs, const uint8_t *da
             uint32_t raw_len = p->partial_len;
             uint32_t seq = log_push_locked(p, 0, line_off,
                                            (const uint8_t *)p->partial, raw_len);
-            bridge_sd_submit(seq, (int64_t)bridge_now_ms(), 0,
+            bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 0,
                              (const uint8_t *)p->partial,
                              (uint16_t)raw_len, (uint16_t)raw_len);
             p->partial_len = 0;
@@ -523,7 +523,7 @@ int bridge_port_write(bridge_port_t *p,
     uint64_t off = p->tx_offset;
     p->tx_offset += len;
     uint32_t seq = log_push_locked(p, 1, off, data, (uint32_t)len);
-    bridge_sd_submit(seq, (int64_t)bridge_now_ms(), 1, data,
+    bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 1, data,
                      (uint16_t)len, (uint16_t)len);
     uint64_t new_off = p->tx_offset;
     xSemaphoreGive(p->lock);
@@ -776,7 +776,7 @@ void bridge_port_log_flush_partial(bridge_port_t *p)
         uint64_t off = p->partial_off;
         uint32_t seq = log_push_locked(p, 0, off,
                                        (const uint8_t *)p->partial, len);
-        bridge_sd_submit(seq, (int64_t)bridge_now_ms(), 0,
+        bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 0,
                          (const uint8_t *)p->partial,
                          (uint16_t)len, (uint16_t)len);
         p->partial_len = 0;

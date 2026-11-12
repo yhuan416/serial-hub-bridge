@@ -169,6 +169,15 @@ menu "serial-hub-bridge"
 
     menu "UART"
 
+        config BRIDGE_PORT_COUNT
+            int "Bridged UART port count"
+            range 1 2
+            default 2
+            help
+                1 = UART1 only (legacy); 2 = UART1 + UART2. Each port has its
+                own ring/RAM/SD namespace; the PSRAM ring size is divided by
+                this count.
+
         config BRIDGE_UART_NUM
             int "UART peripheral number"
             range 0 2
@@ -218,6 +227,27 @@ menu "serial-hub-bridge"
             int "Default stop bits"
             range 1 2
             default 1
+
+        config BRIDGE_UART2_NUM
+            int "UART2 peripheral number"
+            default 2
+            range 0 2
+            depends on BRIDGE_PORT_COUNT > 1
+
+        config BRIDGE_UART2_TX_GPIO
+            int "UART2 TX GPIO"
+            default 4
+            depends on BRIDGE_PORT_COUNT > 1
+
+        config BRIDGE_UART2_RX_GPIO
+            int "UART2 RX GPIO"
+            default 5
+            depends on BRIDGE_PORT_COUNT > 1
+
+        config BRIDGE_UART2_BAUD
+            int "UART2 default baud rate"
+            default 115200
+            depends on BRIDGE_PORT_COUNT > 1
 
         config BRIDGE_UART_RX_BUF
             int "UART driver RX/TX buffer bytes"

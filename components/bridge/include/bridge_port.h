@@ -37,6 +37,7 @@ typedef struct {
     uint32_t log_entries;
     uint32_t log_line_max;
     uint32_t log_partial_max;
+    uint8_t sd_port; /* SD log namespace index (0/1) */
 } bridge_port_config_t;
 
 typedef struct bridge_port bridge_port_t;
