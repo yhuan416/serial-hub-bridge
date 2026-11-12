@@ -7,6 +7,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "qrcodegen.h"
+#include "sdkconfig.h"
 
 #include "spilcd.h"
 
@@ -145,4 +146,17 @@ void bridge_display_show_status(const char *ssid, const char *ip, bool connected
 
     snprintf(line, sizeof(line), "%s", status ? status : "");
     spilcd_show_string(0, 42, FB_W, 16, 12, line, YELLOW);
+
+    /* Always show the fixed wiring so the board can be connected without
+     * opening menuconfig or the serial console. */
+    snprintf(line, sizeof(line), "uart1 TX%d RX%d",
+             CONFIG_BRIDGE_UART_TX_GPIO, CONFIG_BRIDGE_UART_RX_GPIO);
+    spilcd_show_string(0, 56, FB_W, 12, 12, line, GREEN);
+#if CONFIG_BRIDGE_PORT_COUNT > 1
+    snprintf(line, sizeof(line), "uart2 TX%d RX%d",
+             CONFIG_BRIDGE_UART2_TX_GPIO, CONFIG_BRIDGE_UART2_RX_GPIO);
+    spilcd_show_string(0, 68, FB_W, 12, 12, line, CYAN);
+#else
+    spilcd_show_string(0, 68, FB_W, 12, 12, "uart2 off", GRAY);
+#endif
 }

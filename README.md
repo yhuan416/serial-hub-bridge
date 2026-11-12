@@ -141,7 +141,8 @@ BLE Security1 + PoP，二维码就是官方 payload：
   （也可调用 `bridge_prov_factory_reset()`）
 - 凭据由 provisioning manager / WiFi 驱动存 NVS；`bridge_prov` 只负责状态与显示
 
-LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
+LCD 状态页还会显示当前接线：`uart1 TX17 RX18`、`uart2 TX4 RX5`（单口固件显示
+`uart2 off`），方便不看串口日志也能接线。LCD 是正点原子 ESP32-S3 板的 160×80 ST7789（SPI2）：
 
 | 信号 | GPIO |
 |---|---|
