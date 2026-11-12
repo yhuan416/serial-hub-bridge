@@ -149,14 +149,14 @@ void bridge_display_show_status(const char *ssid, const char *ip, bool connected
 
     /* Bottom-right wiring hint: keep it out of the status text's way and
      * leave the last 12 px row fully visible (y=64..75). */
-    snprintf(line, sizeof(line), "U1 %d/%d",
+    snprintf(line, sizeof(line), "U1 TX%d RX%d",
              CONFIG_BRIDGE_UART_TX_GPIO, CONFIG_BRIDGE_UART_RX_GPIO);
-    spilcd_show_string(104, 52, 56, 12, 12, line, GREEN);
+    spilcd_show_string(82, 52, 78, 12, 12, line, GREEN);
 #if CONFIG_BRIDGE_PORT_COUNT > 1
-    snprintf(line, sizeof(line), "U2 %d/%d",
+    snprintf(line, sizeof(line), "U2 TX%d RX%d",
              CONFIG_BRIDGE_UART2_TX_GPIO, CONFIG_BRIDGE_UART2_RX_GPIO);
-    spilcd_show_string(104, 66, 56, 12, 12, line, CYAN);
+    spilcd_show_string(82, 66, 78, 12, 12, line, CYAN);
 #else
-    spilcd_show_string(104, 66, 56, 12, 12, "U2 off", GRAY);
+    spilcd_show_string(82, 66, 78, 12, 12, "U2 off", GRAY);
 #endif
 }
