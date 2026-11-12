@@ -256,17 +256,23 @@ static void uart_rx_task(void *arg)
         }
         case UART_FIFO_OVF:
         case UART_BUFFER_FULL:
-            ESP_LOGW(TAG, "UART%d RX overflow (%s, %u bytes)", (int)p->cfg.uart_num,
-                     ev.type == UART_FIFO_OVF ? "fifo" : "buffer", (unsigned)ev.size);
+            /* Always make an overflow visible. ev.size is normally the number
+             * of bytes still queued; a zero value means the driver could not
+             * report an exact count (unknown, not necessarily zero loss). */
+            p->uart_overflow_events++;
             if (ev.size > 0) {
-                p->uart_overflow_events++;
                 p->uart_overflow_bytes += ev.size;
-                bridge_event_push(BRIDGE_EVENT_WARN, "uart.overflow",
-                                  "%s overflow: %u bytes lost (events=%lu total=%llu)",
-                                  ev.type == UART_FIFO_OVF ? "fifo" : "buffer",
-                                  (unsigned)ev.size, (unsigned long)p->uart_overflow_events,
-                                  (unsigned long long)p->uart_overflow_bytes);
             }
+            ESP_LOGW(TAG, "UART%d RX overflow (%s, %u bytes%s)", (int)p->cfg.uart_num,
+                     ev.type == UART_FIFO_OVF ? "fifo" : "buffer", (unsigned)ev.size,
+                     ev.size ? "" : " unknown");
+            bridge_event_push(BRIDGE_EVENT_WARN, "uart.overflow",
+                              "%s overflow: %s%u bytes%s (events=%lu total=%llu)",
+                              ev.type == UART_FIFO_OVF ? "fifo" : "buffer",
+                              ev.size ? "" : "unknown ", (unsigned)ev.size,
+                              ev.size ? "" : " (count unavailable)",
+                              (unsigned long)p->uart_overflow_events,
+                              (unsigned long long)p->uart_overflow_bytes);
             uart_flush_input(p->cfg.uart_num);
             xQueueReset(p->uart_queue);
             break;
