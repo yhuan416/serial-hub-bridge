@@ -1,12 +1,17 @@
 #include "bridge_v1.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -16,6 +21,8 @@
 #include "mbedtls/base64.h"
 
 #include "bridge_port.h"
+#include "bridge_sd.h"
+#include "sdkconfig.h"
 
 #define TAG "bridge_v1"
 
@@ -32,8 +39,15 @@
 #define FLAG_GAP 1
 #define FLAG_BATCH 4
 
-#define CAP_BYTES (64 * 1024)
+#define CAP_DEFAULT (256 * 1024)
+#define CAP_MIN (32 * 1024)
+#define CAP_MAX (2 * 1024 * 1024)
+#define NVS_NS "shb"
+#define NVS_CAP "cap_bytes"
+#define SPILL_CHUNK (32 * 1024)
+#define SPILL_MAX 48
 #define BATCH_MAX 4096
+#define OUTQ 6
 #define LINGER_MS 60000
 #define WIN_DEFAULT (32 * 1024)
 #define WIN_MAX (64 * 1024)
@@ -63,8 +77,19 @@ typedef struct {
     uint64_t id;
     int port_index;
     uint8_t *bytes;
+    size_t cap_bytes;
     uint64_t oldest;
+    uint64_t ram_base;
     uint64_t newest;
+    struct {
+        uint64_t off;
+        uint32_t len;
+    } spill[SPILL_MAX];
+    int spill_n;
+    uint8_t *stage;
+    uint32_t stage_len;
+    uint64_t stage_off;
+    bool stage_busy;
     uint64_t uart_cursor;
     bool cursor_set;
     bool uart_paused;
@@ -83,12 +108,67 @@ struct v1_conn {
     uint8_t *rx;
     size_t rx_cap;
     size_t rx_len;
+    struct {
+        uint8_t *p;
+        uint16_t n;
+        uint16_t off;
+    } outq[OUTQ];
+    uint8_t oq_r;
+    uint8_t oq_n;
 };
 
 static v1_cap_t s_cap[BRIDGE_MAX_PORTS];
 static v1_conn_t s_conn[MAX_CONNS];
 static SemaphoreHandle_t s_mu;
 static bridge_ctx_t *s_ctx;
+static size_t s_cap_bytes = CAP_DEFAULT;
+
+static size_t clamp_cap(uint32_t n)
+{
+    if (n < CAP_MIN) {
+        n = CAP_MIN;
+    }
+    if (n > CAP_MAX) {
+        n = CAP_MAX;
+    }
+    n &= ~0xfffu;
+    if (n < CAP_MIN) {
+        n = CAP_MIN;
+    }
+    return n;
+}
+
+static size_t cap_size(const v1_cap_t *cap)
+{
+    return cap && cap->cap_bytes ? cap->cap_bytes : s_cap_bytes;
+}
+
+static void load_cap_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    uint32_t v = 0;
+    if (nvs_get_u32(h, NVS_CAP, &v) == ESP_OK && v) {
+        s_cap_bytes = clamp_cap(v);
+    }
+    nvs_close(h);
+}
+
+static bool save_cap_nvs(size_t n)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    esp_err_t err = nvs_set_u32(h, NVS_CAP, (uint32_t)n);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err == ESP_OK;
+}
 
 static uint64_t now_ms(void)
 {
@@ -115,38 +195,86 @@ static void hex12(char out[16])
     out[12] = '\0';
 }
 
-static bool send_all(int fd, const uint8_t *buf, size_t len)
-{
-    size_t sent = 0;
-    while (sent < len) {
-        int n = send(fd, buf + sent, len - sent, 0);
-        if (n <= 0) {
-            return false;
-        }
-        sent += (size_t)n;
-    }
-    return true;
-}
-
-static bool send_frame(v1_conn_t *c, uint8_t type, const uint8_t *payload, uint32_t len)
+static bool enqueue_frame(v1_conn_t *c, uint8_t type, const uint8_t *payload, uint32_t len)
 {
     if (!c || c->fd < 0) {
         return false;
     }
-    uint8_t hdr[HDR] = {0x53, 0x48, 1, type, 0, 0};
-    hdr[6] = (uint8_t)(len & 0xff);
-    hdr[7] = (uint8_t)((len >> 8) & 0xff);
-    hdr[8] = (uint8_t)((len >> 16) & 0xff);
-    hdr[9] = (uint8_t)((len >> 24) & 0xff);
-    if (!send_all(c->fd, hdr, HDR)) {
-        c->fd = -1;
+    if (c->oq_n >= OUTQ) {
         return false;
     }
-    if (len && payload && !send_all(c->fd, payload, len)) {
-        c->fd = -1;
+    uint8_t *buf = (uint8_t *)malloc(HDR + len);
+    if (!buf) {
         return false;
     }
+    memset(buf, 0, HDR);
+    buf[0] = 0x53;
+    buf[1] = 0x48;
+    buf[2] = 1;
+    buf[3] = type;
+    buf[6] = (uint8_t)(len & 0xff);
+    buf[7] = (uint8_t)((len >> 8) & 0xff);
+    buf[8] = (uint8_t)((len >> 16) & 0xff);
+    buf[9] = (uint8_t)((len >> 24) & 0xff);
+    if (len && payload) {
+        memcpy(buf + HDR, payload, len);
+    }
+    uint8_t i = (uint8_t)((c->oq_r + c->oq_n) % OUTQ);
+    c->outq[i].p = buf;
+    c->outq[i].n = (uint16_t)(HDR + len);
+    c->outq[i].off = 0;
+    c->oq_n++;
     return true;
+}
+
+/* 调用方已持锁。只入队，不在锁里 send。 */
+static bool send_frame(v1_conn_t *c, uint8_t type, const uint8_t *payload, uint32_t len)
+{
+    return enqueue_frame(c, type, payload, len);
+}
+
+/* 不持锁。发一帧；发不出去就留在队列里，下次再试。 */
+static int drain_one(v1_conn_t *c)
+{
+    if (!s_mu || xSemaphoreTake(s_mu, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return 0;
+    }
+    if (c->oq_n == 0 || c->fd < 0) {
+        xSemaphoreGive(s_mu);
+        return 0;
+    }
+    uint8_t *p = c->outq[c->oq_r].p;
+    uint16_t n = c->outq[c->oq_r].n;
+    uint16_t off = c->outq[c->oq_r].off;
+    int fd = c->fd;
+    xSemaphoreGive(s_mu);
+    int wr = send(fd, p + off, (size_t)(n - off), MSG_DONTWAIT);
+    if (xSemaphoreTake(s_mu, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return 0;
+    }
+    if (wr < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            xSemaphoreGive(s_mu);
+            return 0;
+        }
+        c->fd = -1;
+        xSemaphoreGive(s_mu);
+        return -1;
+    }
+    if (wr == 0) {
+        c->fd = -1;
+        xSemaphoreGive(s_mu);
+        return -1;
+    }
+    c->outq[c->oq_r].off = (uint16_t)(off + wr);
+    if (c->outq[c->oq_r].off >= c->outq[c->oq_r].n) {
+        free(c->outq[c->oq_r].p);
+        c->outq[c->oq_r].p = NULL;
+        c->oq_r = (uint8_t)((c->oq_r + 1) % OUTQ);
+        c->oq_n--;
+    }
+    xSemaphoreGive(s_mu);
+    return 1;
 }
 
 static bool send_json(v1_conn_t *c, uint8_t type, const char *json)
@@ -193,8 +321,9 @@ static int find_port(bridge_ctx_t *ctx, const char *id)
 
 static void put_bytes(v1_cap_t *cap, uint64_t off, const uint8_t *p, uint32_t n)
 {
-    size_t i = (size_t)(off % CAP_BYTES);
-    size_t first = CAP_BYTES - i;
+    size_t capn = cap_size(cap);
+    size_t i = (size_t)(off % capn);
+    size_t first = capn - i;
     if (first > n) {
         first = n;
     }
@@ -204,10 +333,77 @@ static void put_bytes(v1_cap_t *cap, uint64_t off, const uint8_t *p, uint32_t n)
     }
 }
 
-static void get_bytes(v1_cap_t *cap, uint64_t off, uint8_t *p, uint32_t n)
+static void spill_path(int port, uint64_t off, char *out, size_t n)
 {
-    size_t i = (size_t)(off % CAP_BYTES);
-    size_t first = CAP_BYTES - i;
+#if CONFIG_BRIDGE_SD_ENABLE
+    snprintf(out, n, "%s/shb-cache/p%d/%016llx.bin", CONFIG_BRIDGE_SD_MOUNT_POINT, port,
+             (unsigned long long)off);
+#else
+    (void)port;
+    (void)off;
+    if (n) {
+        out[0] = '\0';
+    }
+#endif
+}
+
+static bool read_spill(v1_cap_t *cap, uint64_t off, uint8_t *p, uint32_t n)
+{
+#if CONFIG_BRIDGE_SD_ENABLE
+    for (int i = 0; i < cap->spill_n && n; i++) {
+        uint64_t s = cap->spill[i].off;
+        uint32_t len = cap->spill[i].len;
+        if (off < s || off >= s + len) {
+            continue;
+        }
+        uint32_t skip = (uint32_t)(off - s);
+        uint32_t take = n;
+        if (skip + take > len) {
+            take = len - skip;
+        }
+        char path[96];
+        spill_path(cap->port_index, s, path, sizeof(path));
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            return false;
+        }
+        if (fseek(f, (long)skip, SEEK_SET) != 0 || fread(p, 1, take, f) != take) {
+            fclose(f);
+            return false;
+        }
+        fclose(f);
+        off += take;
+        p += take;
+        n -= take;
+    }
+    return n == 0;
+#else
+    (void)cap;
+    (void)off;
+    (void)p;
+    (void)n;
+    return false;
+#endif
+}
+
+static bool get_bytes(v1_cap_t *cap, uint64_t off, uint8_t *p, uint32_t n)
+{
+    if (off < cap->ram_base) {
+        uint64_t ram = cap->ram_base;
+        if (off + n <= ram) {
+            return read_spill(cap, off, p, n);
+        }
+        uint32_t head = (uint32_t)(ram - off);
+        if (!read_spill(cap, off, p, head)) {
+            return false;
+        }
+        off = ram;
+        p += head;
+        n -= head;
+    }
+    size_t capn = cap_size(cap);
+    size_t i = (size_t)(off % capn);
+    size_t first = capn - i;
     if (first > n) {
         first = n;
     }
@@ -215,6 +411,7 @@ static void get_bytes(v1_cap_t *cap, uint64_t off, uint8_t *p, uint32_t n)
     if (n > first) {
         memcpy(p + first, cap->bytes, n - first);
     }
+    return true;
 }
 
 static void drop_to(v1_cap_t *cap, uint64_t off)
@@ -238,7 +435,9 @@ static void send_gap(v1_sess_t *s, v1_cap_t *cap, uint64_t off)
     uint64_t ts = now_ms();
     memcpy(raw + 21, &ts, 8);
     raw[29] = FLAG_GAP;
-    send_frame(s->conn, T_DATA, raw, DATA_HDR);
+    if (!send_frame(s->conn, T_DATA, raw, DATA_HDR)) {
+        return;
+    }
     s->sent = off;
     if (s->acked < off) {
         s->acked = off;
@@ -259,9 +458,16 @@ static void send_batch(v1_sess_t *s, v1_cap_t *cap, uint64_t off, uint32_t n)
     uint64_t ts = now_ms();
     memcpy(frame + 21, &ts, 8);
     frame[29] = FLAG_BATCH;
-    get_bytes(cap, off, frame + DATA_HDR, n);
-    send_frame(s->conn, T_DATA, frame, DATA_HDR + n);
+    if (!get_bytes(cap, off, frame + DATA_HDR, n)) {
+        free(frame);
+        return;
+    }
+    bool ok = send_frame(s->conn, T_DATA, frame + 0, DATA_HDR + n);
+    /* send_frame copies; the local header+payload must include payload. */
     free(frame);
+    if (!ok) {
+        return;
+    }
     s->sent = off + n;
     s->last_ms = now_ms();
 }
@@ -274,7 +480,7 @@ static void flush_sess(v1_sess_t *s, v1_cap_t *cap)
     if (s->sent < cap->oldest) {
         send_gap(s, cap, cap->oldest);
     }
-    while (s->sent < cap->newest && s->conn->fd >= 0) {
+    while (s->sent < cap->newest && s->conn->fd >= 0 && s->conn->oq_n < OUTQ - 2) {
         uint64_t room = s->window - (s->sent - s->acked);
         if (room == 0) {
             break;
@@ -329,25 +535,95 @@ static uint64_t retain_floor(v1_cap_t *cap)
     return floor;
 }
 
+static void spill_unlink(v1_cap_t *cap, uint64_t off)
+{
+    char path[96];
+    spill_path(cap->port_index, off, path, sizeof(path));
+    if (path[0]) {
+        unlink(path);
+    }
+}
+
+static void spill_clear(v1_cap_t *cap)
+{
+    for (int i = 0; i < cap->spill_n; i++) {
+        spill_unlink(cap, cap->spill[i].off);
+    }
+    cap->spill_n = 0;
+    free(cap->stage);
+    cap->stage = NULL;
+    cap->stage_len = 0;
+    cap->stage_busy = false;
+}
+
 static void reclaim(v1_cap_t *cap)
 {
     uint64_t floor = retain_floor(cap);
     if (floor > cap->oldest) {
+        int w = 0;
+        for (int i = 0; i < cap->spill_n; i++) {
+            if (cap->spill[i].off + cap->spill[i].len <= floor) {
+                spill_unlink(cap, cap->spill[i].off);
+            } else {
+                cap->spill[w++] = cap->spill[i];
+            }
+        }
+        cap->spill_n = w;
         drop_to(cap, floor);
+        if (floor > cap->ram_base && floor <= cap->newest) {
+            cap->ram_base = floor;
+        }
     }
 }
 
-static void append_bytes(v1_cap_t *cap, const uint8_t *p, uint32_t n)
+static bool stage_spill(v1_cap_t *cap)
+{
+#if CONFIG_BRIDGE_SD_ENABLE
+    if (cap->stage_busy || cap->spill_n >= SPILL_MAX || !bridge_sd_ready()) {
+        return false;
+    }
+    uint64_t have = cap->newest - cap->ram_base;
+    if (have < 4096) {
+        return false;
+    }
+    uint32_t n = have > SPILL_CHUNK ? SPILL_CHUNK : (uint32_t)have;
+    uint8_t *buf = (uint8_t *)malloc(n);
+    if (!buf) {
+        return false;
+    }
+    if (!get_bytes(cap, cap->ram_base, buf, n)) {
+        free(buf);
+        return false;
+    }
+    cap->stage = buf;
+    cap->stage_off = cap->ram_base;
+    cap->stage_len = n;
+    cap->stage_busy = true;
+    cap->ram_base += n;
+    return true;
+#else
+    (void)cap;
+    return false;
+#endif
+}
+
+static bool append_bytes(v1_cap_t *cap, const uint8_t *p, uint32_t n)
 {
     if (!cap->bytes || n == 0) {
-        return;
+        return false;
     }
-    while (cap->newest - cap->oldest + n > CAP_BYTES) {
-        uint64_t drop = cap->oldest + n;
+    while (cap->newest - cap->ram_base + n > cap_size(cap)) {
+        if (stage_spill(cap)) {
+            continue;
+        }
+        uint64_t drop = cap->ram_base + n;
         if (drop > cap->newest) {
             drop = cap->newest;
         }
         drop_to(cap, drop);
+        if (cap->ram_base < cap->oldest) {
+            cap->ram_base = cap->oldest;
+        }
         for (int i = 0; i < MAX_CONNS; i++) {
             for (int j = 0; j < MAX_SESS; j++) {
                 v1_sess_t *s = &s_conn[i].sess[j];
@@ -360,11 +636,12 @@ static void append_bytes(v1_cap_t *cap, const uint8_t *p, uint32_t n)
             break;
         }
     }
-    if (cap->newest - cap->oldest + n > CAP_BYTES) {
-        return;
+    if (cap->stage_busy || cap->newest - cap->ram_base + n > cap_size(cap)) {
+        return false;
     }
     put_bytes(cap, cap->newest, p, n);
     cap->newest += n;
+    return true;
 }
 
 static void jump_gap(v1_cap_t *cap, uint64_t new_off)
@@ -372,7 +649,9 @@ static void jump_gap(v1_cap_t *cap, uint64_t new_off)
     if (new_off < cap->newest) {
         new_off = cap->newest;
     }
+    spill_clear(cap);
     cap->oldest = new_off;
+    cap->ram_base = new_off;
     cap->newest = new_off;
     for (int i = 0; i < MAX_CONNS; i++) {
         for (int j = 0; j < MAX_SESS; j++) {
@@ -430,7 +709,9 @@ static void pull_uart(v1_cap_t *cap)
         res.data_len == 0) {
         return;
     }
-    append_bytes(cap, buf, (uint32_t)res.data_len);
+    if (!append_bytes(cap, buf, (uint32_t)res.data_len)) {
+        return;
+    }
     cap->uart_cursor = res.end;
     flush_cap(cap);
 }
@@ -443,8 +724,84 @@ static void expire_linger(v1_cap_t *cap)
     if (now_ms() < cap->linger_at) {
         return;
     }
+    spill_clear(cap);
     free(cap->bytes);
     memset(cap, 0, sizeof(*cap));
+}
+
+static bool write_spill_file(int port, uint64_t off, const uint8_t *p, uint32_t n)
+{
+#if CONFIG_BRIDGE_SD_ENABLE
+    if (!bridge_sd_ready()) {
+        return false;
+    }
+    char dir[80];
+    snprintf(dir, sizeof(dir), "%s/shb-cache", CONFIG_BRIDGE_SD_MOUNT_POINT);
+    mkdir(dir, 0775);
+    snprintf(dir, sizeof(dir), "%s/shb-cache/p%d", CONFIG_BRIDGE_SD_MOUNT_POINT, port);
+    mkdir(dir, 0775);
+    char path[96];
+    spill_path(port, off, path, sizeof(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return false;
+    }
+    size_t wr = fwrite(p, 1, n, f);
+    fclose(f);
+    return wr == n;
+#else
+    (void)port;
+    (void)off;
+    (void)p;
+    (void)n;
+    return false;
+#endif
+}
+
+static void commit_stages(void)
+{
+    for (int i = 0; i < BRIDGE_MAX_PORTS; i++) {
+        if (!s_mu || xSemaphoreTake(s_mu, pdMS_TO_TICKS(20)) != pdTRUE) {
+            return;
+        }
+        v1_cap_t *cap = &s_cap[i];
+        if (!cap->live || !cap->stage_busy || !cap->stage) {
+            xSemaphoreGive(s_mu);
+            continue;
+        }
+        uint8_t *buf = cap->stage;
+        uint32_t n = cap->stage_len;
+        uint64_t off = cap->stage_off;
+        int port = cap->port_index;
+        cap->stage = NULL;
+        xSemaphoreGive(s_mu);
+        bool ok = write_spill_file(port, off, buf, n);
+        free(buf);
+        if (xSemaphoreTake(s_mu, pdMS_TO_TICKS(50)) != pdTRUE) {
+            continue;
+        }
+        if (cap->live && cap->stage_off == off && cap->stage_busy) {
+            if (ok && cap->spill_n < SPILL_MAX) {
+                cap->spill[cap->spill_n].off = off;
+                cap->spill[cap->spill_n].len = n;
+                cap->spill_n++;
+            } else if (!ok) {
+                for (int c = 0; c < MAX_CONNS; c++) {
+                    for (int j = 0; j < MAX_SESS; j++) {
+                        v1_sess_t *s = &s_conn[c].sess[j];
+                        if (s->used && s->port_index == port && s->sent < cap->ram_base) {
+                            send_gap(s, cap, cap->ram_base);
+                        }
+                    }
+                }
+                if (cap->oldest < cap->ram_base) {
+                    cap->oldest = cap->ram_base;
+                }
+            }
+            cap->stage_busy = false;
+        }
+        xSemaphoreGive(s_mu);
+    }
 }
 
 static void pump_task(void *arg)
@@ -465,7 +822,8 @@ static void pump_task(void *arg)
             }
             xSemaphoreGive(s_mu);
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        commit_stages();
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -478,9 +836,10 @@ static v1_cap_t *ensure_cap(int port_index)
     }
     free(cap->bytes);
     memset(cap, 0, sizeof(*cap));
-    cap->bytes = (uint8_t *)heap_caps_malloc(CAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    cap->cap_bytes = s_cap_bytes;
+    cap->bytes = (uint8_t *)heap_caps_malloc(cap->cap_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!cap->bytes) {
-        cap->bytes = (uint8_t *)malloc(CAP_BYTES);
+        cap->bytes = (uint8_t *)malloc(cap->cap_bytes);
     }
     if (!cap->bytes) {
         return NULL;
@@ -602,7 +961,7 @@ static void on_hello(v1_conn_t *c, const uint8_t *payload, uint32_t len)
     cJSON_AddNumberToObject(window, "ack_interval_bytes", 4096);
     cJSON *capture = cJSON_AddObjectToObject(caps, "capture");
     cJSON_AddNumberToObject(capture, "linger_ms", LINGER_MS);
-    cJSON_AddNumberToObject(capture, "max_bytes", CAP_BYTES);
+    cJSON_AddNumberToObject(capture, "max_bytes", s_cap_bytes);
     cJSON_AddStringToObject(capture, "history", "none");
     cJSON_AddBoolToObject(caps, "can_config", true);
     cJSON_AddBoolToObject(caps, "can_set_lines", true);
@@ -949,6 +1308,40 @@ static void on_ack(v1_conn_t *c, const uint8_t *p, uint32_t len)
     }
 }
 
+static void op_cache_set(v1_conn_t *c, cJSON *msg)
+{
+    double id = jid(msg);
+    cJSON *jb = cJSON_GetObjectItem(msg, "cap_bytes");
+    uint32_t raw = 0;
+    if (cJSON_IsNumber(jb)) {
+        raw = (uint32_t)jb->valuedouble;
+    } else {
+        jb = cJSON_GetObjectItem(msg, "cap_kb");
+        if (!cJSON_IsNumber(jb)) {
+            send_ctrl_err(c, id, "bad_request", "cap_bytes or cap_kb required");
+            return;
+        }
+        raw = (uint32_t)jb->valuedouble * 1024u;
+    }
+    size_t n = clamp_cap(raw);
+    bool saved = save_cap_nvs(n);
+    s_cap_bytes = n;
+    bool live = false;
+    for (int i = 0; i < BRIDGE_MAX_PORTS; i++) {
+        if (s_cap[i].live) {
+            live = true;
+            break;
+        }
+    }
+    char result[128];
+    snprintf(result, sizeof(result),
+             "{\"cap_bytes\":%u,\"saved\":%s,\"applied\":\"%s\"}", (unsigned)n,
+             saved ? "true" : "false", live ? "next" : "now");
+    send_ctrl_ok(c, id, result);
+    ESP_LOGI(TAG, "send cache %u KiB saved=%d apply=%s", (unsigned)(n / 1024), saved,
+             live ? "next" : "now");
+}
+
 static void on_control(v1_conn_t *c, const uint8_t *payload, uint32_t len)
 {
     char *txt = (char *)malloc((size_t)len + 1);
@@ -976,6 +1369,8 @@ static void on_control(v1_conn_t *c, const uint8_t *payload, uint32_t len)
         op_ping(c, msg);
     } else if (strcmp(op, "config") == 0) {
         op_config(c, msg);
+    } else if (strcmp(op, "cache_set") == 0) {
+        op_cache_set(c, msg);
     } else if (strcmp(op, "subscribe") == 0) {
         op_subscribe(c, msg);
     } else if (strcmp(op, "unsubscribe") == 0) {
@@ -1041,11 +1436,13 @@ static v1_conn_t *alloc_conn(void)
 void bridge_v1_start(bridge_ctx_t *ctx)
 {
     s_ctx = ctx;
+    load_cap_nvs();
     if (!s_mu) {
         s_mu = xSemaphoreCreateMutex();
         xTaskCreate(pump_task, "v1_pump", 6144, NULL, 6, NULL);
     }
-    ESP_LOGI(TAG, "v1 batch push ready (cache %u KiB, history none)", (unsigned)(CAP_BYTES / 1024));
+    ESP_LOGI(TAG, "v1 batch push ready (ram %u KiB, spill %u KiB, history none)",
+             (unsigned)(s_cap_bytes / 1024), (unsigned)((SPILL_CHUNK * SPILL_MAX) / 1024));
 }
 
 void bridge_v1_session(bridge_ctx_t *ctx, int fd)
@@ -1063,23 +1460,37 @@ void bridge_v1_session(bridge_ctx_t *ctx, int fd)
         ESP_LOGE(TAG, "no session slot");
         return;
     }
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    uint8_t tmp[512];
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    uint8_t tmp[1024];
     while (c->fd >= 0) {
-        int n = recv(fd, tmp, sizeof(tmp), 0);
-        if (xSemaphoreTake(s_mu, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            continue;
+        int n = recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (xSemaphoreTake(s_mu, portMAX_DELAY) != pdTRUE) {
+            break;
         }
         if (n < 0) {
             check_lease(c);
+            for (int j = 0; j < MAX_SESS; j++) {
+                if (c->sess[j].used) {
+                    flush_sess(&c->sess[j], &s_cap[c->sess[j].port_index]);
+                }
+            }
             xSemaphoreGive(s_mu);
+            if (drain_one(c) < 0) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
             continue;
-        }
-        if (n == 0) {
-            xSemaphoreGive(s_mu);
-            break;
         }
         if (c->rx_len + (size_t)n > c->rx_cap) {
             size_t ncap = c->rx_cap * 2;
@@ -1128,11 +1539,17 @@ void bridge_v1_session(bridge_ctx_t *ctx, int fd)
             c->rx_len -= off;
         }
         xSemaphoreGive(s_mu);
+        while (drain_one(c) > 0) {
+        }
         if (bad || c->fd < 0) {
             break;
         }
     }
     xSemaphoreTake(s_mu, portMAX_DELAY);
+    for (int i = 0; i < OUTQ; i++) {
+        free(c->outq[i].p);
+        c->outq[i].p = NULL;
+    }
     for (int i = 0; i < MAX_SESS; i++) {
         if (c->sess[i].used) {
             detach_sess(&c->sess[i]);
