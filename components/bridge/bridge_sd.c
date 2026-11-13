@@ -47,6 +47,17 @@
 #define RETENTION_EVERY 60
 #define SD_Q_HDR 20
 
+/* Export/writer scratch is large and transient; prefer PSRAM so internal DRAM
+ * stays available for Wi-Fi/PHY and TCP session stacks. */
+static void *sd_alloc(size_t n)
+{
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        p = malloc(n);
+    }
+    return p;
+}
+
 typedef struct __attribute__((packed)) {
     uint32_t seq;
     uint32_t tick_ms;
@@ -1296,7 +1307,7 @@ bool bridge_sd_submit(uint8_t port, uint32_t seq, int64_t tick_ms, uint8_t dir,
 static void sd_writer_task(void *arg)
 {
     (void)arg;
-    uint8_t *buf = (uint8_t *)malloc(CONFIG_BRIDGE_MAX_FRAME);
+    uint8_t *buf = (uint8_t *)sd_alloc(CONFIG_BRIDGE_MAX_FRAME);
     if (!buf) {
         ESP_LOGE(TAG, "writer buffer alloc failed");
         vTaskDelete(NULL);
@@ -1660,7 +1671,7 @@ esp_err_t bridge_sd_export(int port, const bridge_sd_export_req_t *req, bridge_s
         return ESP_FAIL;
     }
 
-    sd_idx_rec_t *recs = (sd_idx_rec_t *)malloc(sizeof(sd_idx_rec_t) * EXPORT_LINES_MAX);
+    sd_idx_rec_t *recs = (sd_idx_rec_t *)sd_alloc(sizeof(sd_idx_rec_t) * EXPORT_LINES_MAX);
     if (!recs) {
         fclose(idx);
         fclose(raw);
@@ -1747,8 +1758,8 @@ esp_err_t bridge_sd_export(int port, const bridge_sd_export_req_t *req, bridge_s
     }
 
     const size_t chunk_len = (size_t)(end_off - start_off);
-    uint8_t *chunk = (uint8_t *)malloc(chunk_len ? chunk_len : 1);
-    uint8_t *index = (uint8_t *)malloc(sizeof(sd_idx_rec_t) * count);
+    uint8_t *chunk = (uint8_t *)sd_alloc(chunk_len ? chunk_len : 1);
+    uint8_t *index = (uint8_t *)sd_alloc(sizeof(sd_idx_rec_t) * count);
     if (!chunk || !index) {
         free(chunk);
         free(index);

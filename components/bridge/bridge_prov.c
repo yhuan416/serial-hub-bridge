@@ -114,6 +114,14 @@ static void build_qr(void)
 #endif
 }
 
+static void wifi_disable_power_save(void)
+{
+    esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "disable Wi-Fi power save failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void reconnect_cb(TimerHandle_t t)
 {
     (void)t;
@@ -219,6 +227,7 @@ static void on_prov_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (s_reconnect_timer) {
             xTimerStop(s_reconnect_timer, 0);
         }
+        wifi_disable_power_save();
         bridge_time_start();
         bridge_display_hide_qr();
         refresh_display();
@@ -287,6 +296,7 @@ esp_err_t bridge_prov_init(void)
         ESP_LOGI(TAG, "already provisioned; starting STA");
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
+        wifi_disable_power_save();
         refresh_display();
     } else {
         s_state = BRIDGE_PROV_PROVISIONING;

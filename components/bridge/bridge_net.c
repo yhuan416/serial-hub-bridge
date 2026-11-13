@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -12,102 +13,23 @@
 #include "lwip/sockets.h"
 
 #include "bridge_button.h"
-#include "bridge_proto.h"
+#include "bridge_v1.h"
 #include "bridge_prov.h"
 #include "bridge_auth.h"
 
 #define TAG "bridge_net"
 
-#define RECV_CHUNK 512
+#define MIN_INTERNAL_HEAP (24 * 1024)
 
-static bool send_all(int fd, const char *buf, size_t len)
+/* Session buffers are large and long-lived; keep them out of internal DRAM
+ * so Wi-Fi/PHY timer allocations still succeed under log/export load. */
+static void *net_alloc(size_t n)
 {
-    size_t sent = 0;
-    while (sent < len) {
-        int n = send(fd, buf + sent, len - sent, 0);
-        if (n <= 0) {
-            return false;
-        }
-        sent += (size_t)n;
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        p = malloc(n);
     }
-    return true;
-}
-
-static void send_frame(int fd, const char *json)
-{
-    if (!json) {
-        return;
-    }
-    if (send_all(fd, json, strlen(json))) {
-        send_all(fd, "\n", 1);
-    }
-}
-
-static void frame_too_large(int fd, uint32_t max_frame)
-{
-    char buf[192];
-    snprintf(buf, sizeof(buf),
-             "{\"id\":null,\"ok\":false,\"error\":{\"code\":\"frame_too_large\","
-             "\"message\":\"frame exceeds max_frame=%u\"}}",
-             (unsigned)max_frame);
-    send_frame(fd, buf);
-}
-
-static void session_run(bridge_ctx_t *ctx, int fd)
-{
-    size_t cap = (size_t)ctx->max_frame + 1;
-    char *line = (char *)malloc(cap);
-    if (!line) {
-        ESP_LOGE(TAG, "OOM for line buffer");
-        return;
-    }
-
-    size_t used = 0;
-    bool authed = !(ctx->token && ctx->token[0]);
-    bool close_after = false;
-    char tmp[RECV_CHUNK];
-
-    for (;;) {
-        int n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n <= 0) {
-            break;
-        }
-
-        for (int i = 0; i < n; i++) {
-            char c = tmp[i];
-            if (c == '\n') {
-                while (used > 0 && (line[used - 1] == '\r' || line[used - 1] == ' ' ||
-                                    line[used - 1] == '\t')) {
-                    used--;
-                }
-                size_t start = 0;
-                while (start < used && (line[start] == ' ' || line[start] == '\t')) {
-                    start++;
-                }
-                line[used] = '\0';
-                if (used > start) {
-                    char *resp = bridge_proto_handle(ctx, &authed, line + start, &close_after);
-                    if (resp) {
-                        send_frame(fd, resp);
-                        free(resp);
-                    }
-                }
-                used = 0;
-                if (close_after) {
-                    goto done;
-                }
-            } else {
-                if (used >= cap - 1) {
-                    frame_too_large(fd, ctx->max_frame);
-                    goto done;
-                }
-                line[used++] = c;
-            }
-        }
-    }
-
-done:
-    free(line);
+    return p;
 }
 
 typedef struct {
@@ -122,7 +44,7 @@ static void session_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    session_run(&a->ctx, a->fd);
+    bridge_v1_session(&a->ctx, a->fd);
     shutdown(a->fd, SHUT_RDWR);
     close(a->fd);
     if (a->ctx.scratch) free(a->ctx.scratch);
@@ -159,7 +81,7 @@ static void serve_forever(bridge_ctx_t *ctx, uint16_t port)
         return;
     }
 
-    ESP_LOGI(TAG, "listening on tcp://0.0.0.0:%u (proto %s)", (unsigned)port, BRIDGE_PROTO_VERSION);
+    ESP_LOGI(TAG, "listening on tcp://0.0.0.0:%u", (unsigned)port);
 
     for (;;) {
         struct sockaddr_in peer;
@@ -174,8 +96,17 @@ static void serve_forever(bridge_ctx_t *ctx, uint16_t port)
         int nodelay = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        ESP_LOGI(TAG, "client %s:%u connected", inet_ntoa(peer.sin_addr),
-                 (unsigned)ntohs(peer.sin_port));
+        const size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI(TAG, "client %s:%u connected (heap internal=%u psram=%u)",
+                 inet_ntoa(peer.sin_addr), (unsigned)ntohs(peer.sin_port),
+                 (unsigned)int_free, (unsigned)psram_free);
+        if (int_free < MIN_INTERNAL_HEAP) {
+            ESP_LOGE(TAG, "rejecting session: internal heap too low (%u < %u)",
+                     (unsigned)int_free, (unsigned)MIN_INTERNAL_HEAP);
+            close(fd);
+            continue;
+        }
         session_arg_t *a = (session_arg_t *)calloc(1, sizeof(*a));
         if (!a) {
             close(fd);
@@ -184,7 +115,7 @@ static void serve_forever(bridge_ctx_t *ctx, uint16_t port)
         a->ctx = *ctx;
         a->ctx.port = ctx->ports[0];
         a->ctx.port_index = 0;
-        a->ctx.scratch = (uint8_t *)malloc(a->ctx.scratch_cap ? a->ctx.scratch_cap : 32768);
+        a->ctx.scratch = (uint8_t *)net_alloc(a->ctx.scratch_cap ? a->ctx.scratch_cap : 32768);
         if (!a->ctx.scratch) {
             free(a);
             close(fd);
@@ -217,5 +148,6 @@ void bridge_net_run(bridge_ctx_t *ctx, const bridge_net_config_t *cfg)
     ESP_LOGI(TAG, "auth=%s", ctx->token ? "on" : "off");
 
     bridge_button_init();
+    bridge_v1_start(ctx);
     serve_forever(ctx, cfg->tcp_port);
 }

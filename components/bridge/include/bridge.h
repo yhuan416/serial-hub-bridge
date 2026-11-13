@@ -17,8 +17,8 @@
 extern "C" {
 #endif
 
-#define BRIDGE_PROTO_VERSION "v0"
-#define BRIDGE_FW_VERSION "0.1.0"
+#define BRIDGE_PROTO_VERSION "v1"
+#define BRIDGE_FW_VERSION "0.2.0"
 #define BRIDGE_PORT_ID "uart0"
 #define BRIDGE_PORT_KIND "uart"
 #define BRIDGE_MAX_PORTS 2

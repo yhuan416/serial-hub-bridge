@@ -18,6 +18,9 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Keep enough internal DRAM for Wi-Fi/PHY timers even when PSRAM buffers and
+# TCP sessions are under heavy log-export load.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 
 # NimBLE for network_provisioning (BLE provisioning transport).
 CONFIG_BT_ENABLED=y

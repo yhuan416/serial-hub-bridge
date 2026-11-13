@@ -28,7 +28,6 @@ idf_component_register(
         "bridge_ring.c"
         "bridge_read.c"
         "bridge_port.c"
-        "bridge_proto.c"
         "bridge_net.c"
         "bridge_prov.c"
         "bridge_button.c"
@@ -36,5 +35,6 @@ idf_component_register(
         "bridge_event.c"
         "bridge_time.c"
         "bridge_auth.c"
+        "bridge_v1.c"
     INCLUDE_DIRS "include"
     REQUIRES ${bridge_requires})

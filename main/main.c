@@ -16,7 +16,6 @@
 #include "bridge_event.h"
 #include "bridge_net.h"
 #include "bridge_port.h"
-#include "bridge_proto.h"
 #include "bridge_sd.h"
 #include "bridge_time.h"
 
@@ -24,8 +23,7 @@ static const char *TAG = "app";
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "serial-hub-bridge %s (proto %s)", BRIDGE_FW_VERSION, BRIDGE_PROTO_VERSION);
-    bridge_proto_reset();
+    ESP_LOGI(TAG, "serial-hub-bridge %s", BRIDGE_FW_VERSION);
     bridge_time_init();
     if (bridge_event_init() != ESP_OK) {
         ESP_LOGW(TAG, "event log init failed");
@@ -102,6 +100,11 @@ void app_main(void)
         ESP_LOGE(TAG, "failed to allocate %u-byte scratch buffer", (unsigned)ctx.scratch_cap);
         return;
     }
+
+    ESP_LOGI(TAG, "heap internal free=%u min=%u psram free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     bridge_net_config_t nc = {
         .tcp_port = CONFIG_BRIDGE_TCP_PORT,
