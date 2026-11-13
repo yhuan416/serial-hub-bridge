@@ -1,7 +1,7 @@
 /*
  * Byte ring with absolute offsets (pure C, no ESP-IDF dependency).
  *
- * Semantics match the host's v0 device model:
+ * UART byte ring. Not a log store.
  *   - `end`     : absolute offset of the next byte to be appended
  *                 (i.e. "bytes received so far", 0-based next position)
  *   - `start`   : absolute offset of the oldest byte still buffered

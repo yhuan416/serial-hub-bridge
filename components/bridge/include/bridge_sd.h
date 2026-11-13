@@ -1,12 +1,6 @@
 /*
- * Device-authoritative SD log: raw bytes + fixed-size line index.
- *
- * Layout (current segment):
- *   /sdcard/shb/raw-<epoch>-<rand>.bin   raw RX/TX bytes, append-only
- *   /sdcard/shb/idx-<epoch>-<rand>.bin   sd_idx_rec_t, one per line/TX write
- *
- * The RAM ring stays the live window for READ; SD is the durable history used
- * by LOG_STATS / LOG_EXPORT after the agent comes back.
+ * SD mount helper. The live link does not write this line index.
+ * v1 spill uses bridge_sd_ready() and its own /sdcard/shb-cache files.
  */
 #pragma once
 

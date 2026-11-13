@@ -1,8 +1,8 @@
 /*
- * serial-hub-bridge — ESP32-S3 wireless serial bridge (v0 device side).
+ * serial-hub-bridge — ESP32-S3 wireless serial bridge.
  *
- * UART <-> TCP/NDJSON RPC, implementing
- * serial-hub-mcp/docs/remote-link-protocol.md (proto v0).
+ * UART <-> TCP binary frames. Contract:
+ * serial-hub-mcp/docs/remote-link-protocol-v1.md
  */
 
 #include <string.h>
@@ -43,7 +43,7 @@ void app_main(void)
         .flow_control = "none",
         .ring_bytes = CONFIG_BRIDGE_RING_BYTES,
         .uart_rx_buf = CONFIG_BRIDGE_UART_RX_BUF,
-        .log_entries = CONFIG_BRIDGE_LOG_ENTRIES,
+        .log_entries = 0,
         .log_line_max = CONFIG_BRIDGE_LOG_LINE_MAX,
         .log_partial_max = CONFIG_BRIDGE_LOG_PARTIAL_MAX,
     };

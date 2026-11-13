@@ -2,8 +2,7 @@
  * Control-plane event log (bounded RAM ring, independent of the data log).
  *
  * Examples: SD mount/format/remount, write/fsync errors, ring drops.
- * Events are also emitted to the serial console via ESP_LOG; EVENT_QUERY
- * exposes them to the host without touching the UART data path.
+ * Events are printed with ESP_LOG. The binary link does not expose EVENT_QUERY.
  */
 #pragma once
 

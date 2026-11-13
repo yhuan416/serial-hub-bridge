@@ -1,9 +1,8 @@
 /*
- * v0 READ decision logic (pure C, no ESP-IDF dependency).
+ * Byte-window helper (pure C, no ESP-IDF dependency).
  *
- * This mirrors the host-side reference implementation
- * (serial-hub-mcp/test-utils/fake_bridge.js `_read`), which is the normative
- * behaviour the host tests exercise:
+ * The v1 pump uses this to copy UART-ring bytes into the send cache.
+ * It is not a host-visible READ RPC.
  *
  *   stop priority: match > max_bytes/min_bytes > idle > budget
  *

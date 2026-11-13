@@ -1,8 +1,6 @@
 #include "bridge_port.h"
 #include "bridge.h"
 #include "bridge_event.h"
-#include "bridge_sd.h"
-#include "bridge_time.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -122,93 +120,12 @@ static uart_stop_bits_t map_stop_bits(uint8_t n)
     return n == 2 ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
 }
 
-static uint32_t log_push_locked(bridge_port_t *p, uint8_t dir, uint64_t offset, const uint8_t *data, uint32_t len)
-{
-    uint32_t seq = ++p->log_seq;
-    if (!p->log_meta || p->log_cap == 0 || p->cfg.log_line_max == 0) {
-        return seq;
-    }
-
-    uint32_t slot;
-    if (p->log_count < p->log_cap) {
-        slot = (p->log_head + p->log_count) % p->log_cap;
-        p->log_count++;
-    } else {
-        slot = p->log_head;
-        p->log_head = (p->log_head + 1) % p->log_cap;
-    }
-
-    bridge_log_meta_t *m = &p->log_meta[slot];
-    m->seq = seq;
-    m->ts_synced = bridge_time_synced();
-    m->ts_ms = m->ts_synced ? (int64_t)bridge_time_epoch_ms()
-                            : (int64_t)bridge_now_ms();
-    m->dir = dir;
-    m->offset = offset;
-    m->bytes = len;
-
-    uint32_t n = len;
-    if (n > p->cfg.log_line_max) {
-        n = p->cfg.log_line_max;
-        m->truncated = true;
-    } else {
-        m->truncated = false;
-    }
-    if (n > 0 && data) {
-        memcpy(p->log_text + (size_t)slot * p->cfg.log_line_max, data, n);
-    }
-    m->text_len = n;
-    return seq;
-}
-
-static void log_rx_locked(bridge_port_t *p, uint64_t base_abs, const uint8_t *data, size_t len)
-{
-    if (!p->partial || p->cfg.log_partial_max == 0) {
-        return;
-    }
-
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = data[i];
-        if (c == '\n') {
-            uint32_t n = p->partial_len;
-            if (n > 0 && p->partial[n - 1] == '\r') {
-                n--;
-            }
-            uint64_t line_off = p->partial_off;
-            uint32_t raw_len = (uint32_t)((base_abs + i + 1) - line_off);
-            uint32_t seq = log_push_locked(p, 0, line_off,
-                                           (const uint8_t *)p->partial, n);
-            bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 0,
-                             (const uint8_t *)p->partial,
-                             (uint16_t)p->partial_len, (uint16_t)raw_len);
-            p->partial_len = 0;
-            p->partial_off = base_abs + i + 1;
-            continue;
-        }
-
-        if (p->partial_len >= p->cfg.log_partial_max) {
-            /* line exceeds the assembly cap: keep it as a truncated entry */
-            uint64_t line_off = p->partial_off;
-            uint32_t raw_len = p->partial_len;
-            uint32_t seq = log_push_locked(p, 0, line_off,
-                                           (const uint8_t *)p->partial, raw_len);
-            bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 0,
-                             (const uint8_t *)p->partial,
-                             (uint16_t)raw_len, (uint16_t)raw_len);
-            p->partial_len = 0;
-            p->partial_off = base_abs + i;
-        }
-        p->partial[p->partial_len++] = (char)c;
-    }
-}
-
 static void port_ingest(bridge_port_t *p, const uint8_t *data, size_t len)
 {
     if (!p || len == 0) {
         return;
     }
     xSemaphoreTake(p->lock, portMAX_DELAY);
-    uint64_t base = p->ring.end;
     uint64_t dropped_before = p->ring.dropped;
     bridge_ring_append(&p->ring, data, len);
     if (p->ring.dropped > dropped_before) {
@@ -221,7 +138,6 @@ static void port_ingest(bridge_port_t *p, const uint8_t *data, size_t len)
                               p->ring.cap, (unsigned long long)p->ring.dropped);
         }
     }
-    log_rx_locked(p, base, data, len);
     xSemaphoreGive(p->lock);
     xEventGroupSetBits(p->events, PORT_EV_RX);
 }
@@ -526,11 +442,7 @@ int bridge_port_write(bridge_port_t *p,
     }
 
     xSemaphoreTake(p->lock, portMAX_DELAY);
-    uint64_t off = p->tx_offset;
     p->tx_offset += len;
-    uint32_t seq = log_push_locked(p, 1, off, data, (uint32_t)len);
-    bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 1, data,
-                     (uint16_t)len, (uint16_t)len);
     uint64_t new_off = p->tx_offset;
     xSemaphoreGive(p->lock);
 
@@ -538,7 +450,7 @@ int bridge_port_write(bridge_port_t *p,
         *tx_offset = new_off;
     }
     if (tx_log_seq) {
-        *tx_log_seq = seq;
+        *tx_log_seq = 0;
     }
     return n;
 }
@@ -778,13 +690,6 @@ void bridge_port_log_flush_partial(bridge_port_t *p)
     }
     xSemaphoreTake(p->lock, portMAX_DELAY);
     if (p->partial_len > 0) {
-        uint32_t len = p->partial_len;
-        uint64_t off = p->partial_off;
-        uint32_t seq = log_push_locked(p, 0, off,
-                                       (const uint8_t *)p->partial, len);
-        bridge_sd_submit(p->cfg.sd_port, seq, (int64_t)bridge_now_ms(), 0,
-                         (const uint8_t *)p->partial,
-                         (uint16_t)len, (uint16_t)len);
         p->partial_len = 0;
         p->partial_off = p->ring.end;
     }

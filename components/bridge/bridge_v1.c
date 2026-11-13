@@ -967,7 +967,7 @@ static void on_hello(v1_conn_t *c, const uint8_t *payload, uint32_t len)
     cJSON_AddBoolToObject(caps, "can_set_lines", true);
     cJSON_AddBoolToObject(caps, "can_break", true);
     cJSON_AddNumberToObject(caps, "lease_ms", LEASE_DEFAULT);
-    cJSON_AddBoolToObject(caps, "events", true);
+    cJSON_AddBoolToObject(caps, "events", false);
     char *out = cJSON_PrintUnformatted(root);
     if (out) {
         send_json(c, T_HELLO_ACK, out);

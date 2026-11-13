@@ -1,9 +1,8 @@
 /*
- * Shared state for the v0 serial bridge.
+ * Shared state for the serial bridge.
  *
- * This firmware implements the device side of
- * serial-hub-mcp/docs/remote-link-protocol.md (proto "v0"):
- * NDJSON request/response over TCP, pull-only, absolute byte offsets.
+ * Contract: serial-hub-mcp/docs/remote-link-protocol-v1.md
+ * Binary frames. The device keeps only unacked send-cache bytes.
  */
 #pragma once
 

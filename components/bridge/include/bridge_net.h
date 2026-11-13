@@ -1,5 +1,5 @@
 /*
- * WiFi STA + TCP server + NDJSON session loop for the v0 bridge.
+ * WiFi STA + TCP server. Sessions speak the binary link, not NDJSON.
  */
 #pragma once
 

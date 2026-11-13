@@ -11,7 +11,7 @@ main/main.c
             └─ bridge_port.c
                  ├─ bridge_ring.c
                  └─ bridge_read.c
-bridge_sd.c                挂载 SD；另有一套旧的行索引，不进 TCP 数据面
+bridge_sd.c                挂载 SD，只给发送缓存溢出用。不再写行索引
 bridge_auth.c              NVS token
 bridge_prov.c              BLE 配网
 ```
